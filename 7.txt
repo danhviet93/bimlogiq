@@ -1,0 +1,26 @@
+class Inputs { }
+class Output
+{
+    public string Path { get; set; }
+}
+
+static class Native
+{
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(System.IntPtr h);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern System.IntPtr SetActiveWindow(System.IntPtr h);
+    public static void FocusRevit(System.IntPtr h) { SetForegroundWindow(h); SetActiveWindow(h); }
+}
+
+/// <summary>Opens a save file dialog to select the Central Model save location and file name.</summary>
+/// <param name="input">No inputs.</param>
+/// <returns>The path chosen by the user.</returns>
+Output Run(Inputs input)
+{
+    var dialog = new Microsoft.Win32.SaveFileDialog();
+    dialog.Filter = "Revit Files (*.rvt)|*.rvt|All files (*.*)|*.*";
+    dialog.Title = "Select Location and Name for Central Model";
+    dialog.FileName = "02_EIF_STR_Central.rvt";
+    Native.FocusRevit(UIApp.MainWindowHandle);
+    string selectedPath = dialog.ShowDialog() == true ? dialog.FileName : "";
+    return new Output { Path = selectedPath };
+}

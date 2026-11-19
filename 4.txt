@@ -1,0 +1,1777 @@
+class Inputs { }
+
+class Output
+{
+    public bool Success { get; set; }
+    public int WallsRebuilt { get; set; }
+    public int ColumnsRebuilt { get; set; }
+    public int FloorsRebuilt { get; set; }
+    public int DoorsRebuilt { get; set; }
+    public int WindowsRebuilt { get; set; }
+    public int WoodWallsPreserved { get; set; }
+    public int WoodColsPreserved { get; set; }
+    public string LinkTitle { get; set; }
+}
+
+public class DuplicateTypeNamesHandler : IDuplicateTypeNamesHandler
+{
+    public DuplicateTypeAction OnDuplicateTypeNamesFound(DuplicateTypeNamesHandlerArgs args)
+    {
+        return DuplicateTypeAction.UseDestinationTypes;
+    }
+}
+
+/// <summary>Reconstruit et normalise de manière idempotente (sans doublons) 100% des éléments structurels depuis la maquette Archi vers des familles STR.</summary>
+/// <param name="input">Aucun paramètre requis.</param>
+/// <returns>Statistiques des éléments reconstruits et normalisés.</returns>
+Output Run(Inputs input)
+{
+    Document doc = UIDoc.Document;
+
+    RevitLinkInstance linkInstance = new FilteredElementCollector(doc)
+        .OfClass(typeof(RevitLinkInstance))
+        .Cast<RevitLinkInstance>()
+        .FirstOrDefault();
+
+    if (linkInstance == null)
+    {
+        Logger.AppendLine("Erreur: Aucune maquette liée trouvée dans le projet hôte.");
+        return new Output { Success = false, LinkTitle = "Aucun lien" };
+    }
+
+    Document linkDoc = linkInstance.GetLinkDocument();
+    if (linkDoc == null)
+    {
+        Logger.AppendLine("Erreur: La maquette liée est déchargée.");
+        return new Output { Success = false, LinkTitle = linkInstance.Name };
+    }
+
+    Transform totalTransform = linkInstance.GetTotalTransform();
+
+    bool IsWoodElement(Element elem)
+    {
+        if (elem is Wall w)
+        {
+            string tName = w.WallType.Name;
+            return tName.IndexOf("Bois", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   tName.IndexOf("MOB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   tName.IndexOf("Ossature", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        else if (elem is FamilyInstance fi)
+        {
+            string famName = fi.Symbol.Family.Name;
+            string symName = fi.Symbol.Name;
+            return famName.IndexOf("Bois", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   symName.IndexOf("Bois", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        return false;
+    }
+
+    bool HasStructuralLayer(Wall w)
+    {
+        if (w == null || w.WallType == null) return false;
+
+        string wtName = w.WallType.Name.ToUpperInvariant();
+        if (wtName.Contains("CLOISON") || wtName.Contains("DOUBLAGE") || wtName.Contains("FINITION") || wtName.Contains("PLACO"))
+        {
+            return false;
+        }
+
+        string[] porteurParamNames = new string[] { 
+            "Porteur", "PORTEUR", "013EX_Porteur", "0013EX_Porteur", "0013EC_Porteur", "013EC_Porteur", "Portant", "PORTANT"
+        };
+        foreach (string pName in porteurParamNames)
+        {
+            Parameter p = w.LookupParameter(pName) ?? w.WallType.LookupParameter(pName);
+            if (p != null && p.HasValue)
+            {
+                if (p.StorageType == StorageType.Integer && p.AsInteger() == 1) return true;
+                if (p.StorageType == StorageType.Integer && p.AsInteger() == 0) return false;
+                string sVal = p.AsString() ?? p.AsValueString() ?? "";
+                if (sVal.Equals("OUI", StringComparison.OrdinalIgnoreCase) || sVal.Equals("TRUE", StringComparison.OrdinalIgnoreCase) || sVal.Equals("1")) return true;
+                if (sVal.Equals("NON", StringComparison.OrdinalIgnoreCase) || sVal.Equals("FALSE", StringComparison.OrdinalIgnoreCase) || sVal.Equals("0")) return false;
+            }
+        }
+
+        Parameter pStructUsage = w.get_Parameter(BuiltInParameter.WALL_STRUCTURAL_USAGE_PARAM);
+        if (pStructUsage != null && pStructUsage.HasValue && pStructUsage.AsInteger() != 0) return true;
+
+        Parameter pStructLookup = w.LookupParameter("Structure") ?? w.LookupParameter("Structurel");
+        if (pStructLookup != null && pStructLookup.HasValue && pStructLookup.AsInteger() == 1) return true;
+
+        CompoundStructure cs = w.WallType.GetCompoundStructure();
+        if (cs != null)
+        {
+            IList<CompoundStructureLayer> layers = cs.GetLayers();
+            foreach (CompoundStructureLayer layer in layers)
+            {
+                if (layer.Function == MaterialFunctionAssignment.Structure)
+                {
+                    return true;
+                }
+            }
+        }
+
+        if (wtName.Contains("STR_") || wtName.Contains("VOILE") || wtName.Contains("PORTEUR") || wtName.Contains("PORTANT") || wtName.Contains("BETON") || wtName.Contains("BÉTON") || wtName.Contains("C25") || wtName.Contains("C30"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    bool HasStructuralLayerFloor(Floor f)
+    {
+        if (f == null || f.FloorType == null) return false;
+
+        string ftName = f.FloorType.Name.ToUpperInvariant();
+
+        if (ftName.Contains("CARRELAGE") || ftName.Contains("PARQUET") || ftName.Contains("CHAPE") || 
+            ftName.Contains("FINITION") || ftName.Contains("ISOLATION") || ftName.Contains("REVETEMENT") || 
+            ftName.Contains("REVÊTEMENT") || ftName.Contains("FAUX PLANCHER") || ftName.Contains("MOQUETTE"))
+        {
+            return false;
+        }
+
+        string[] porteurParamNames = new string[] { 
+            "Porteur", "PORTEUR", "013EX_Porteur", "0013EX_Porteur", "0013EC_Porteur", "013EC_Porteur"
+        };
+        foreach (string pName in porteurParamNames)
+        {
+            Parameter p = f.LookupParameter(pName) ?? f.FloorType.LookupParameter(pName);
+            if (p != null && p.HasValue)
+            {
+                if (p.StorageType == StorageType.Integer && p.AsInteger() == 1) return true;
+                if (p.StorageType == StorageType.Integer && p.AsInteger() == 0) return false;
+                string sVal = p.AsString() ?? p.AsValueString() ?? "";
+                if (sVal.Equals("OUI", StringComparison.OrdinalIgnoreCase) || sVal.Equals("TRUE", StringComparison.OrdinalIgnoreCase) || sVal.Equals("1")) return true;
+                if (sVal.Equals("NON", StringComparison.OrdinalIgnoreCase) || sVal.Equals("FALSE", StringComparison.OrdinalIgnoreCase) || sVal.Equals("0")) return false;
+            }
+        }
+
+        Parameter pStruct = f.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL);
+        if (pStruct != null && pStruct.HasValue && pStruct.AsInteger() == 1) return true;
+
+        CompoundStructure cs = f.FloorType.GetCompoundStructure();
+        if (cs != null)
+        {
+            IList<CompoundStructureLayer> layers = cs.GetLayers();
+            foreach (CompoundStructureLayer layer in layers)
+            {
+                if (layer.Function == MaterialFunctionAssignment.Structure)
+                {
+                    return true;
+                }
+            }
+        }
+
+        if (ftName.Contains("STR_") || ftName.Contains("DALLE") || ftName.Contains("CSP") || ftName.Contains("STRUCTURE") || ftName.Contains("BETON") || ftName.Contains("BÉTON") || ftName.Contains("RADIER") || ftName.Contains("C25") || ftName.Contains("C30"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    bool HasInnerLoops(Floor f)
+    {
+        if (f == null) return false;
+        try
+        {
+            Options opts = new Options { DetailLevel = ViewDetailLevel.Fine };
+            GeometryElement geom = f.get_Geometry(opts);
+            if (geom != null)
+            {
+                foreach (GeometryObject obj in geom)
+                {
+                    if (obj is Solid solid && solid.Faces.Size > 0)
+                    {
+                        foreach (Face face in solid.Faces)
+                        {
+                            if (face is PlanarFace pf && Math.Abs(pf.FaceNormal.Z) > 0.9)
+                            {
+                                if (pf.EdgeLoops.Size > 1) return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    void EnableStructuralParameter(Element elem)
+    {
+        if (elem == null) return;
+
+        if (elem is Wall w)
+        {
+            Parameter pUsage = w.get_Parameter(BuiltInParameter.WALL_STRUCTURAL_USAGE_PARAM);
+            if (pUsage != null && !pUsage.IsReadOnly)
+            {
+                try { if (pUsage.AsInteger() == 0) pUsage.Set(1); } catch { }
+            }
+
+            Parameter pStructLookup = w.LookupParameter("Structure") ?? w.LookupParameter("Structurel");
+            if (pStructLookup != null && !pStructLookup.IsReadOnly)
+            {
+                try { pStructLookup.Set(1); } catch { }
+            }
+        }
+        else if (elem is Floor f)
+        {
+            Parameter pStruct = f.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL);
+            if (pStruct != null && !pStruct.IsReadOnly)
+            {
+                try { pStruct.Set(1); } catch { }
+            }
+
+            Parameter pStructLookup = f.LookupParameter("Structure") ?? f.LookupParameter("Structurel");
+            if (pStructLookup != null && !pStructLookup.IsReadOnly)
+            {
+                try { pStructLookup.Set(1); } catch { }
+            }
+        }
+        else
+        {
+            Parameter pStruct = elem.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL)
+                             ?? elem.get_Parameter(BuiltInParameter.WALL_STRUCTURAL_USAGE_PARAM)
+                             ?? elem.LookupParameter("Structure");
+            if (pStruct != null && !pStruct.IsReadOnly)
+            {
+                try { pStruct.Set(1); } catch { }
+            }
+        }
+    }
+
+    string GetLocalisationValue(Element elem)
+    {
+        if (elem == null) return null;
+
+        string ExtractParamValue(Parameter p)
+        {
+            if (p == null || !p.HasValue) return null;
+            if (p.StorageType == StorageType.String)
+            {
+                string s = p.AsString();
+                if (!string.IsNullOrWhiteSpace(s)) return s;
+            }
+            string vs = p.AsValueString();
+            if (!string.IsNullOrWhiteSpace(vs)) return vs;
+            if (p.StorageType == StorageType.Integer)
+            {
+                int valInt = p.AsInteger();
+                return valInt.ToString();
+            }
+            if (p.StorageType == StorageType.Double)
+            {
+                return p.AsDouble().ToString();
+            }
+            return null;
+        }
+
+        string[] targetNames = new string[] { 
+            "013EX_localisation", "0013EX_localisation", "013EX_Localisation", "0013EX_Localisation",
+            "013EX_location", "0013EX_location", "013EX_Location", "0013EX_Location",
+            "0013EC_Localisation", "013EC_Localisation", "13EC_Localisation", "Localisation", "LOCALISATION",
+            "0013EC_Location", "013EC_Location", "13EC_Location", "Location", "LOCATION",
+            "0013EC_Emplacement", "Emplacement", "EMPLACEMENT", "Repérage", "Reperage"
+        };
+
+        foreach (string tName in targetNames)
+        {
+            Parameter p = elem.LookupParameter(tName);
+            string val = ExtractParamValue(p);
+            if (!string.IsNullOrWhiteSpace(val)) return val;
+        }
+
+        foreach (Parameter p in elem.Parameters)
+        {
+            if (p == null || !p.HasValue) continue;
+            string pName = p.Definition?.Name ?? "";
+            if (pName.IndexOf("localisation", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                pName.IndexOf("location", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                pName.IndexOf("013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                pName.IndexOf("0013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                pName.IndexOf("013EC", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                pName.IndexOf("0013EC", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                pName.IndexOf("emplacement", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                string val = ExtractParamValue(p);
+                if (!string.IsNullOrWhiteSpace(val)) return val;
+            }
+        }
+
+        ElementId typeId = elem.GetTypeId();
+        if (typeId != ElementId.InvalidElementId)
+        {
+            Element typeElem = elem.Document.GetElement(typeId);
+            if (typeElem != null)
+            {
+                foreach (string tName in targetNames)
+                {
+                    Parameter p = typeElem.LookupParameter(tName);
+                    string val = ExtractParamValue(p);
+                    if (!string.IsNullOrWhiteSpace(val)) return val;
+                }
+
+                foreach (Parameter p in typeElem.Parameters)
+                {
+                    if (p == null || !p.HasValue) continue;
+                    string pName = p.Definition?.Name ?? "";
+                    if (pName.IndexOf("localisation", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        pName.IndexOf("location", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        pName.IndexOf("013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        pName.IndexOf("0013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        pName.IndexOf("013EC", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        pName.IndexOf("0013EC", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        pName.IndexOf("emplacement", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        string val = ExtractParamValue(p);
+                        if (!string.IsNullOrWhiteSpace(val)) return val;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    bool IsExteriorByLocalisationOrKeyword(Element elem)
+    {
+        if (elem == null) return false;
+
+        int TestString(string str)
+        {
+            if (string.IsNullOrWhiteSpace(str)) return 0;
+            string s = str.Trim().ToUpperInvariant();
+
+            bool hasExt = s.Contains("EXTERIEUR") || s.Contains("EXTÉRIEUR") || s.Contains("EXTERIOR") || 
+                         s.Contains("FACADE") || s.Contains("FAÇADE") || s.Contains("EXTERNE") || 
+                         s.Contains("ENVELOPPE") || s.Contains("ENVÉLOPPE") || s.Contains("SOUBASSEMENT") ||
+                         s == "EXT" || s.StartsWith("EXT_") || s.EndsWith("_EXT") || s.Contains("-EXT-") || 
+                         s.Contains(" EXT ") || s.StartsWith("EXT ") || s.EndsWith(" EXT") || s.Contains(".EXT.") ||
+                         s == "1";
+
+            bool hasInt = s.Contains("INTERIEUR") || s.Contains("INTÉRIEUR") || s.Contains("INTERIOR") || 
+                         s == "INT" || s.StartsWith("INT_") || s.EndsWith("_INT") || s.Contains("-INT-") || 
+                         s.Contains(" INT ") || s.StartsWith("INT ") || s.EndsWith(" INT") || s.Contains(".INT.") ||
+                         s == "0" || s == "2";
+
+            if (hasExt && !hasInt) return 1;
+            if (hasInt && !hasExt) return -1;
+            if (hasExt && hasInt) return 1;
+
+            return 0;
+        }
+
+        string locVal = GetLocalisationValue(elem);
+        if (!string.IsNullOrWhiteSpace(locVal))
+        {
+            int rLoc = TestString(locVal);
+            if (rLoc == 1) return true;
+            if (rLoc == -1) return false;
+        }
+
+        ElementId typeId = elem.GetTypeId();
+        if (typeId != ElementId.InvalidElementId)
+        {
+            Element typeElem = elem.Document.GetElement(typeId);
+            if (typeElem != null)
+            {
+                int rType = TestString(typeElem.Name);
+                if (rType == 1) return true;
+                if (rType == -1) return false;
+
+                if (typeElem is FamilySymbol sym && sym.Family != null)
+                {
+                    int rFam = TestString(sym.Family.Name);
+                    if (rFam == 1) return true;
+                    if (rFam == -1) return false;
+                }
+
+                if (typeElem is WallType wt)
+                {
+                    if (wt.Function == WallFunction.Exterior) return true;
+                    if (wt.Function == WallFunction.Interior) return false;
+                }
+            }
+        }
+
+        foreach (Parameter p in elem.Parameters)
+        {
+            if (p == null || !p.HasValue) continue;
+            string pVal = p.AsString() ?? p.AsValueString() ?? "";
+            int rVal = TestString(pVal);
+            if (rVal == 1) return true;
+            if (rVal == -1) return false;
+        }
+
+        if (typeId != ElementId.InvalidElementId)
+        {
+            Element typeElem = elem.Document.GetElement(typeId);
+            if (typeElem != null)
+            {
+                foreach (Parameter p in typeElem.Parameters)
+                {
+                    if (p == null || !p.HasValue) continue;
+                    string pVal = p.AsString() ?? p.AsValueString() ?? "";
+                    int rVal = TestString(pVal);
+                    if (rVal == 1) return true;
+                    if (rVal == -1) return false;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    void CopyLocalisationValueSmart(Element sourceElem, Element targetElem)
+    {
+        if (sourceElem == null || targetElem == null) return;
+
+        string val = GetLocalisationValue(sourceElem);
+        if (string.IsNullOrEmpty(val)) return;
+
+        string[] targetNames = new string[] { 
+            "013EX_localisation", "0013EX_localisation", "013EX_Localisation", "0013EX_Localisation",
+            "0013EC_Localisation", "013EC_Localisation", "13EC_Localisation", "Localisation",
+            "013EX_location", "0013EX_location", "0013EC_Location", "013EC_Location", "Location"
+        };
+
+        Parameter pTarget = null;
+        foreach (string tName in targetNames)
+        {
+            pTarget = targetElem.LookupParameter(tName);
+            if (pTarget != null && !pTarget.IsReadOnly) break;
+        }
+
+        if (pTarget == null || pTarget.IsReadOnly)
+        {
+            foreach (Parameter p in targetElem.Parameters)
+            {
+                if (p != null && !p.IsReadOnly && p.Definition != null)
+                {
+                    string name = p.Definition.Name;
+                    if (name.IndexOf("localisation", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("location", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("0013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        name.IndexOf("013EC", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        pTarget = p;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (pTarget == null || pTarget.IsReadOnly)
+        {
+            ElementId typeId = targetElem.GetTypeId();
+            if (typeId != ElementId.InvalidElementId)
+            {
+                Element typeElem = targetElem.Document.GetElement(typeId);
+                if (typeElem != null)
+                {
+                    foreach (string tName in targetNames)
+                    {
+                        pTarget = typeElem.LookupParameter(tName);
+                        if (pTarget != null && !pTarget.IsReadOnly) break;
+                    }
+
+                    if (pTarget == null || pTarget.IsReadOnly)
+                    {
+                        foreach (Parameter p in typeElem.Parameters)
+                        {
+                            if (p != null && !p.IsReadOnly && p.Definition != null)
+                            {
+                                string name = p.Definition.Name;
+                                if (name.IndexOf("localisation", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    name.IndexOf("location", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    name.IndexOf("013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    name.IndexOf("0013EX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    name.IndexOf("013EC", StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    pTarget = p;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (pTarget != null && !pTarget.IsReadOnly)
+        {
+            try
+            {
+                pTarget.Set(val);
+            }
+            catch { }
+        }
+    }
+
+    XYZ GetElementLocationPoint(Element elem, Transform transform)
+    {
+        XYZ pt = null;
+        if (elem.Location is LocationPoint locPt)
+        {
+            pt = transform.OfPoint(locPt.Point);
+        }
+        else if (elem.Location is LocationCurve locCurve)
+        {
+            pt = transform.OfPoint(locCurve.Curve.GetEndPoint(0));
+        }
+        else
+        {
+            BoundingBoxXYZ bb = elem.get_BoundingBox(null);
+            if (bb != null)
+            {
+                pt = transform.OfPoint((bb.Min + bb.Max) * 0.5);
+            }
+        }
+        return pt;
+    }
+
+    List<Level> hostStructLevels = new FilteredElementCollector(doc)
+        .OfClass(typeof(Level))
+        .Cast<Level>()
+        .Where(l => l.get_Parameter(BuiltInParameter.LEVEL_IS_STRUCTURAL)?.AsInteger() == 1)
+        .OrderBy(l => l.Elevation)
+        .ToList();
+
+    if (hostStructLevels.Count == 0)
+    {
+        hostStructLevels = new FilteredElementCollector(doc)
+            .OfClass(typeof(Level))
+            .Cast<Level>()
+            .OrderBy(l => l.Elevation)
+            .ToList();
+    }
+
+    List<Level> linkLevels = new FilteredElementCollector(linkDoc)
+        .OfClass(typeof(Level))
+        .Cast<Level>()
+        .ToList();
+
+    Dictionary<ElementId, Level> linkLevelToHostStructLevel = new Dictionary<ElementId, Level>();
+    foreach (Level linkLvl in linkLevels)
+    {
+        CheckCancellationRequested();
+        string targetName = "PH-" + linkLvl.Name;
+        Level match = hostStructLevels.FirstOrDefault(l => string.Equals(l.Name.Trim(), targetName.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (match == null) match = hostStructLevels.OrderBy(l => Math.Abs(l.Elevation - linkLvl.Elevation)).FirstOrDefault();
+        if (match != null) linkLevelToHostStructLevel[linkLvl.Id] = match;
+    }
+
+    List<WallType> strWallTypes = new FilteredElementCollector(doc)
+        .OfClass(typeof(WallType))
+        .Cast<WallType>()
+        .Where(wt => wt.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase) && wt.Kind == WallKind.Basic)
+        .ToList();
+
+    WallType baseStrWallType = strWallTypes.FirstOrDefault() 
+        ?? new FilteredElementCollector(doc).OfClass(typeof(WallType)).Cast<WallType>().FirstOrDefault(wt => wt.Kind == WallKind.Basic);
+
+    double GetThickestStructuralLayerWidth(Wall w)
+    {
+        if (w == null || w.WallType == null) return 0.2;
+        CompoundStructure cs = w.WallType.GetCompoundStructure();
+        if (cs != null)
+        {
+            IList<CompoundStructureLayer> layers = cs.GetLayers();
+            double maxStructWidth = 0;
+
+            foreach (CompoundStructureLayer layer in layers)
+            {
+                if (layer.Function == MaterialFunctionAssignment.Structure)
+                {
+                    if (layer.Width > maxStructWidth) maxStructWidth = layer.Width;
+                }
+            }
+            if (maxStructWidth > 0.001) return maxStructWidth;
+
+            int cStart = cs.GetFirstCoreLayerIndex();
+            int cEnd = cs.GetLastCoreLayerIndex();
+            if (cStart >= 0 && cEnd >= cStart && cEnd < layers.Count)
+            {
+                for (int i = cStart; i <= cEnd; i++)
+                {
+                    if (layers[i].Width > maxStructWidth) maxStructWidth = layers[i].Width;
+                }
+                if (maxStructWidth > 0.001) return maxStructWidth;
+            }
+
+            foreach (CompoundStructureLayer layer in layers)
+            {
+                if (layer.Width > maxStructWidth) maxStructWidth = layer.Width;
+            }
+            if (maxStructWidth > 0.001) return maxStructWidth;
+        }
+        return w.Width;
+    }
+
+    WallType GetOrCreateStrWallType(Document d, double widthFt, bool isExterior)
+    {
+        double widthCm = Math.Round(UnitUtils.ConvertFromInternalUnits(widthFt, UnitTypeId.Centimeters));
+        if (widthCm <= 0) widthCm = 20;
+        string suffix = isExterior ? "EXT" : "INT";
+
+        WallType existing = strWallTypes.FirstOrDefault(wt => wt != null &&
+            Math.Abs(UnitUtils.ConvertFromInternalUnits(wt.Width, UnitTypeId.Centimeters) - widthCm) < 0.2 &&
+            wt.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+        if (existing != null)
+        {
+            CompoundStructure csEx = existing.GetCompoundStructure();
+            if (csEx != null && csEx.LayerCount > 1)
+            {
+                try
+                {
+                    CompoundStructure singleCs = CompoundStructure.CreateSingleLayerCompoundStructure(MaterialFunctionAssignment.Structure, widthFt, ElementId.InvalidElementId);
+                    existing.SetCompoundStructure(singleCs);
+                }
+                catch { }
+            }
+            return existing;
+        }
+
+        string newName = $"STR_VO_{widthCm}_C25_{suffix}";
+        WallType existingByName = new FilteredElementCollector(d)
+            .OfClass(typeof(WallType))
+            .Cast<WallType>()
+            .FirstOrDefault(wt => wt != null && string.Equals(wt.Name.Trim(), newName.Trim(), StringComparison.OrdinalIgnoreCase));
+
+        if (existingByName != null)
+        {
+            CompoundStructure csEx = existingByName.GetCompoundStructure();
+            if (csEx != null && csEx.LayerCount > 1)
+            {
+                try
+                {
+                    CompoundStructure singleCs = CompoundStructure.CreateSingleLayerCompoundStructure(MaterialFunctionAssignment.Structure, widthFt, ElementId.InvalidElementId);
+                    existingByName.SetCompoundStructure(singleCs);
+                }
+                catch { }
+            }
+            if (!strWallTypes.Contains(existingByName)) strWallTypes.Add(existingByName);
+            return existingByName;
+        }
+
+        WallType templateType = strWallTypes.FirstOrDefault(wt => wt != null && wt.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                             ?? strWallTypes.FirstOrDefault(wt => wt != null)
+                             ?? baseStrWallType
+                             ?? new FilteredElementCollector(d).OfClass(typeof(WallType)).Cast<WallType>().FirstOrDefault(wt => wt.Kind == WallKind.Basic);
+
+        if (templateType != null)
+        {
+            try
+            {
+                WallType duplicated = templateType.Duplicate(newName) as WallType;
+                if (duplicated != null)
+                {
+                    try
+                    {
+                        CompoundStructure singleCs = CompoundStructure.CreateSingleLayerCompoundStructure(MaterialFunctionAssignment.Structure, widthFt, ElementId.InvalidElementId);
+                        duplicated.SetCompoundStructure(singleCs);
+                    }
+                    catch
+                    {
+                        CompoundStructure cs = duplicated.GetCompoundStructure();
+                        if (cs != null && cs.LayerCount > 0)
+                        {
+                            int coreIndex = cs.GetFirstCoreLayerIndex();
+                            if (coreIndex < 0 || coreIndex >= cs.LayerCount) coreIndex = 0;
+                            cs.SetLayerWidth(coreIndex, widthFt);
+                            duplicated.SetCompoundStructure(cs);
+                        }
+                    }
+                    strWallTypes.Add(duplicated);
+                    return duplicated;
+                }
+            }
+            catch { }
+        }
+
+        WallType fallbackWithSuffix = strWallTypes.FirstOrDefault(wt => wt != null && wt.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                                   ?? new FilteredElementCollector(d).OfClass(typeof(WallType)).Cast<WallType>().FirstOrDefault(wt => wt.Kind == WallKind.Basic && wt.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+        if (fallbackWithSuffix != null) return fallbackWithSuffix;
+
+        return baseStrWallType;
+    }
+
+    List<FloorType> strFloorTypes = new FilteredElementCollector(doc)
+        .OfClass(typeof(FloorType))
+        .Cast<FloorType>()
+        .Where(ft => ft.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+    FloorType baseStrFloorType = strFloorTypes.FirstOrDefault()
+        ?? new FilteredElementCollector(doc).OfClass(typeof(FloorType)).Cast<FloorType>().FirstOrDefault();
+
+    FloorType GetOrCreateStrFloorType(Document d, double thickFt, bool isExterior)
+    {
+        double thickCm = Math.Round(UnitUtils.ConvertFromInternalUnits(thickFt, UnitTypeId.Centimeters));
+        if (thickCm <= 0) thickCm = 20;
+        string suffix = isExterior ? "EXT" : "INT";
+        string targetName = $"STR_CSP_{thickCm}_C25_{suffix}";
+
+        FloorType existingByName = new FilteredElementCollector(d)
+            .OfClass(typeof(FloorType))
+            .Cast<FloorType>()
+            .FirstOrDefault(ft => ft != null && string.Equals(ft.Name.Trim(), targetName.Trim(), StringComparison.OrdinalIgnoreCase));
+
+        if (existingByName != null)
+        {
+            return existingByName;
+        }
+
+        FloorType templateType = new FilteredElementCollector(d)
+            .OfClass(typeof(FloorType))
+            .Cast<FloorType>()
+            .FirstOrDefault(ft => ft.Name.StartsWith("STR_CSP_", StringComparison.OrdinalIgnoreCase))
+            ?? new FilteredElementCollector(d)
+                .OfClass(typeof(FloorType))
+                .Cast<FloorType>()
+                .FirstOrDefault(ft => ft.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase))
+            ?? new FilteredElementCollector(d)
+                .OfClass(typeof(FloorType))
+                .Cast<FloorType>()
+                .FirstOrDefault();
+
+        if (templateType != null)
+        {
+            try
+            {
+                FloorType duplicated = templateType.Duplicate(targetName) as FloorType;
+                if (duplicated != null)
+                {
+                    CompoundStructure cs = duplicated.GetCompoundStructure();
+                    if (cs != null && cs.LayerCount > 0)
+                    {
+                        int coreIndex = cs.GetFirstCoreLayerIndex();
+                        if (coreIndex < 0 || coreIndex >= cs.LayerCount) coreIndex = 0;
+                        cs.SetLayerWidth(coreIndex, thickFt);
+                        duplicated.SetCompoundStructure(cs);
+                    }
+                    return duplicated;
+                }
+            }
+            catch { }
+        }
+
+        return templateType;
+    }
+
+    FamilySymbol GetOrCreateStrDoorSymbol(Document d, Document lDoc, FamilyInstance linkDoor, bool isExterior)
+    {
+        if (linkDoor == null || linkDoor.Symbol == null) return null;
+
+        FamilySymbol linkSym = linkDoor.Symbol;
+        string suffix = isExterior ? "EXT" : "INT";
+
+        double wFt = 2.8;
+        double hFt = 6.8;
+
+        Parameter pW = linkSym.LookupParameter("Largeur") ?? linkSym.LookupParameter("Width") ?? linkSym.get_Parameter(BuiltInParameter.DOOR_WIDTH);
+        if (pW != null && pW.HasValue && pW.AsDouble() > 0.1) wFt = pW.AsDouble();
+
+        Parameter pH = linkSym.LookupParameter("Hauteur") ?? linkSym.LookupParameter("Height") ?? linkSym.get_Parameter(BuiltInParameter.DOOR_HEIGHT);
+        if (pH != null && pH.HasValue && pH.AsDouble() > 0.1) hFt = pH.AsDouble();
+
+        double widthCm = Math.Round(UnitUtils.ConvertFromInternalUnits(wFt, UnitTypeId.Centimeters));
+        double heightCm = Math.Round(UnitUtils.ConvertFromInternalUnits(hFt, UnitTypeId.Centimeters));
+
+        List<FamilySymbol> hostDoorSymbols = new FilteredElementCollector(d)
+            .OfCategory(BuiltInCategory.OST_Doors)
+            .OfClass(typeof(FamilySymbol))
+            .Cast<FamilySymbol>()
+            .ToList();
+
+        string targetName = $"STR_PO_{widthCm}x{heightCm}_{suffix}";
+
+        if (hostDoorSymbols.Count > 0)
+        {
+            FamilySymbol existingByName = hostDoorSymbols.FirstOrDefault(s => string.Equals(s.Name.Trim(), targetName.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (existingByName != null)
+            {
+                if (!existingByName.IsActive) existingByName.Activate();
+                return existingByName;
+            }
+
+            FamilySymbol strBaseSym = hostDoorSymbols.FirstOrDefault(s => s.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                ?? hostDoorSymbols.FirstOrDefault(s => s.Family.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase) || s.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase))
+                ?? hostDoorSymbols.FirstOrDefault();
+
+            if (strBaseSym != null)
+            {
+                try
+                {
+                    FamilySymbol dupSym = strBaseSym.Duplicate(targetName) as FamilySymbol;
+                    if (dupSym != null)
+                    {
+                        Parameter pDupW = dupSym.LookupParameter("Largeur") ?? dupSym.LookupParameter("Width") ?? dupSym.get_Parameter(BuiltInParameter.DOOR_WIDTH);
+                        if (pDupW != null && !pDupW.IsReadOnly) pDupW.Set(wFt);
+
+                        Parameter pDupH = dupSym.LookupParameter("Hauteur") ?? dupSym.LookupParameter("Height") ?? dupSym.get_Parameter(BuiltInParameter.DOOR_HEIGHT);
+                        if (pDupH != null && !pDupH.IsReadOnly) pDupH.Set(hFt);
+
+                        if (!dupSym.IsActive) dupSym.Activate();
+                        return dupSym;
+                    }
+                }
+                catch { }
+
+                if (!strBaseSym.IsActive) strBaseSym.Activate();
+                return strBaseSym;
+            }
+        }
+
+        try
+        {
+            CopyPasteOptions options = new CopyPasteOptions();
+            options.SetDuplicateTypeNamesHandler(new DuplicateTypeNamesHandler());
+            ICollection<ElementId> copied = ElementTransformUtils.CopyElements(lDoc, new List<ElementId> { linkSym.Id }, d, null, options);
+            if (copied != null && copied.Count > 0)
+            {
+                FamilySymbol copiedSym = d.GetElement(copied.First()) as FamilySymbol;
+                if (copiedSym != null)
+                {
+                    try { copiedSym.Name = targetName; } catch { }
+                    if (!copiedSym.IsActive) copiedSym.Activate();
+                    return copiedSym;
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    FamilySymbol GetOrCreateStrWinSymbol(Document d, Document lDoc, FamilyInstance linkWin, bool isExterior)
+    {
+        if (linkWin == null || linkWin.Symbol == null) return null;
+
+        FamilySymbol linkSym = linkWin.Symbol;
+        string suffix = isExterior ? "EXT" : "INT";
+
+        double wFt = 3.0;
+        double hFt = 4.0;
+
+        Parameter pW = linkSym.LookupParameter("Largeur") ?? linkSym.LookupParameter("Width") ?? linkSym.get_Parameter(BuiltInParameter.WINDOW_WIDTH);
+        if (pW != null && pW.HasValue && pW.AsDouble() > 0.1) wFt = pW.AsDouble();
+
+        Parameter pH = linkSym.LookupParameter("Hauteur") ?? linkSym.LookupParameter("Height") ?? linkSym.get_Parameter(BuiltInParameter.WINDOW_HEIGHT);
+        if (pH != null && pH.HasValue && pH.AsDouble() > 0.1) hFt = pH.AsDouble();
+
+        double widthCm = Math.Round(UnitUtils.ConvertFromInternalUnits(wFt, UnitTypeId.Centimeters));
+        double heightCm = Math.Round(UnitUtils.ConvertFromInternalUnits(hFt, UnitTypeId.Centimeters));
+
+        List<FamilySymbol> hostWinSymbols = new FilteredElementCollector(d)
+            .OfCategory(BuiltInCategory.OST_Windows)
+            .OfClass(typeof(FamilySymbol))
+            .Cast<FamilySymbol>()
+            .ToList();
+
+        string targetName = $"STR_FE_{widthCm}x{heightCm}_{suffix}";
+
+        if (hostWinSymbols.Count > 0)
+        {
+            FamilySymbol existingByName = hostWinSymbols.FirstOrDefault(s => string.Equals(s.Name.Trim(), targetName.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (existingByName != null)
+            {
+                if (!existingByName.IsActive) existingByName.Activate();
+                return existingByName;
+            }
+
+            FamilySymbol strBaseSym = hostWinSymbols.FirstOrDefault(s => s.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                ?? hostWinSymbols.FirstOrDefault(s => s.Family.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase) || s.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase))
+                ?? hostWinSymbols.FirstOrDefault();
+
+            if (strBaseSym != null)
+            {
+                try
+                {
+                    FamilySymbol dupSym = strBaseSym.Duplicate(targetName) as FamilySymbol;
+                    if (dupSym != null)
+                    {
+                        Parameter pDupW = dupSym.LookupParameter("Largeur") ?? dupSym.LookupParameter("Width") ?? dupSym.get_Parameter(BuiltInParameter.WINDOW_WIDTH);
+                        if (pDupW != null && !pDupW.IsReadOnly) pDupW.Set(wFt);
+
+                        Parameter pDupH = dupSym.LookupParameter("Hauteur") ?? dupSym.LookupParameter("Height") ?? dupSym.get_Parameter(BuiltInParameter.WINDOW_HEIGHT);
+                        if (pDupH != null && !pDupH.IsReadOnly) pDupH.Set(hFt);
+
+                        if (!dupSym.IsActive) dupSym.Activate();
+                        return dupSym;
+                    }
+                }
+                catch { }
+
+                if (!strBaseSym.IsActive) strBaseSym.Activate();
+                return strBaseSym;
+            }
+        }
+
+        try
+        {
+            CopyPasteOptions options = new CopyPasteOptions();
+            options.SetDuplicateTypeNamesHandler(new DuplicateTypeNamesHandler());
+            ICollection<ElementId> copied = ElementTransformUtils.CopyElements(lDoc, new List<ElementId> { linkSym.Id }, d, null, options);
+            if (copied != null && copied.Count > 0)
+            {
+                FamilySymbol copiedSym = d.GetElement(copied.First()) as FamilySymbol;
+                if (copiedSym != null)
+                {
+                    try { copiedSym.Name = targetName; } catch { }
+                    if (!copiedSym.IsActive) copiedSym.Activate();
+                    return copiedSym;
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    int wallsRebuilt = 0;
+    int columnsRebuilt = 0;
+    int floorsRebuilt = 0;
+    int shaftsRebuilt = 0;
+    int doorsRebuilt = 0;
+    int windowsRebuilt = 0;
+    int woodWallsPreserved = 0;
+    int woodColsPreserved = 0;
+
+    Dictionary<ElementId, Wall> linkWallToHostWallMap = new Dictionary<ElementId, Wall>();
+    List<Wall> createdHostWalls = new List<Wall>();
+
+    List<Wall> existingHostWalls = new FilteredElementCollector(doc)
+        .OfClass(typeof(Wall))
+        .Cast<Wall>()
+        .Where(w => w.WallType != null && w.WallType.Kind == WallKind.Basic)
+        .ToList();
+
+    List<FamilyInstance> existingHostColumns = new FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_StructuralColumns)
+        .OfClass(typeof(FamilyInstance))
+        .Cast<FamilyInstance>()
+        .ToList();
+
+    List<Floor> existingHostFloors = new FilteredElementCollector(doc)
+        .OfClass(typeof(Floor))
+        .Cast<Floor>()
+        .ToList();
+
+    List<FamilyInstance> existingHostDoors = new FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_Doors)
+        .OfClass(typeof(FamilyInstance))
+        .Cast<FamilyInstance>()
+        .ToList();
+
+    List<FamilyInstance> existingHostWindows = new FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_Windows)
+        .OfClass(typeof(FamilyInstance))
+        .Cast<FamilyInstance>()
+        .ToList();
+
+    using (Transaction t = new Transaction(doc, "[argus] Reconstruire STR (Idempotent)"))
+    {
+        t.Start();
+
+        List<Wall> linkWalls = new FilteredElementCollector(linkDoc)
+            .OfClass(typeof(Wall))
+            .Cast<Wall>()
+            .Where(w => w.WallType != null && w.WallType.Kind == WallKind.Basic && HasStructuralLayer(w))
+            .ToList();
+
+        int wallStep = 0;
+        foreach (Wall linkWall in linkWalls)
+        {
+            CheckCancellationRequested();
+            wallStep++;
+            ProgressUpdate($"Reconstruction Tường Kết Cấu, {wallStep} / {linkWalls.Count}", wallStep, linkWalls.Count);
+
+            if (!(linkWall.Location is LocationCurve locCurve)) continue;
+
+            Curve hostCurve = locCurve.Curve.CreateTransformed(totalTransform);
+            if (hostCurve == null || hostCurve.Length < 0.01) continue;
+
+            Level hostBaseLvl = linkLevelToHostStructLevel.TryGetValue(linkWall.LevelId, out var hL) ? hL : hostStructLevels.FirstOrDefault();
+            if (hostBaseLvl == null) continue;
+
+            double wallHeight = 10.0;
+            Parameter pLinkHeight = linkWall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM);
+            if (pLinkHeight != null && pLinkHeight.HasValue && Math.Abs(pLinkHeight.AsDouble()) > 0.1)
+            {
+                wallHeight = Math.Abs(pLinkHeight.AsDouble());
+            }
+            if (wallHeight < 0.1) wallHeight = 10.0;
+
+            bool isWood = IsWoodElement(linkWall);
+            bool isExterior = IsExteriorByLocalisationOrKeyword(linkWall);
+            WallType targetType = null;
+
+            double targetWidthFt = GetThickestStructuralLayerWidth(linkWall);
+
+            if (isWood)
+            {
+                woodWallsPreserved++;
+            }
+            else
+            {
+                targetType = GetOrCreateStrWallType(doc, targetWidthFt, isExterior);
+            }
+
+            if (targetType == null)
+            {
+                if (isExterior)
+                {
+                    targetType = strWallTypes.FirstOrDefault(wt => wt != null && wt.Name.EndsWith("EXT", StringComparison.OrdinalIgnoreCase))
+                        ?? new FilteredElementCollector(doc).OfClass(typeof(WallType)).Cast<WallType>().FirstOrDefault(wt => wt.Kind == WallKind.Basic && wt.Name.EndsWith("EXT", StringComparison.OrdinalIgnoreCase));
+                }
+                if (targetType == null) targetType = baseStrWallType;
+            }
+
+            Wall createdWall = existingHostWalls.FirstOrDefault(hw => 
+                hw.LevelId == hostBaseLvl.Id && 
+                hw.Location is LocationCurve hc && 
+                hc.Curve.GetEndPoint(0).DistanceTo(hostCurve.GetEndPoint(0)) < 0.5 &&
+                hc.Curve.GetEndPoint(1).DistanceTo(hostCurve.GetEndPoint(1)) < 0.5);
+
+            if (createdWall != null)
+            {
+                if (targetType != null && createdWall.IsValidType(targetType.Id))
+                {
+                    try { createdWall.ChangeTypeId(targetType.Id); } catch { }
+                }
+            }
+            else
+            {
+                if (targetType != null)
+                {
+                    try
+                    {
+                        createdWall = Wall.Create(doc, hostCurve, targetType.Id, hostBaseLvl.Id, wallHeight, 0.0, false, false);
+                        if (createdWall != null) existingHostWalls.Add(createdWall);
+                    }
+                    catch { }
+                }
+            }
+
+            if (createdWall != null)
+            {
+                Parameter pBaseOffset = createdWall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET);
+                if (pBaseOffset != null && !pBaseOffset.IsReadOnly) pBaseOffset.Set(0.0);
+
+                Parameter pLinkTopLvl = linkWall.get_Parameter(BuiltInParameter.WALL_HEIGHT_TYPE);
+                if (pLinkTopLvl != null && pLinkTopLvl.HasValue)
+                {
+                    ElementId linkTopLvlId = pLinkTopLvl.AsElementId();
+                    if (linkTopLvlId != ElementId.InvalidElementId && linkLevelToHostStructLevel.TryGetValue(linkTopLvlId, out Level hostTopLvl))
+                    {
+                        if (hostTopLvl.Elevation > hostBaseLvl.Elevation)
+                        {
+                            Parameter pTopLvl = createdWall.get_Parameter(BuiltInParameter.WALL_HEIGHT_TYPE);
+                            if (pTopLvl != null && !pTopLvl.IsReadOnly)
+                            {
+                                try { pTopLvl.Set(hostTopLvl.Id); } catch { }
+                            }
+                            Parameter pTopOffset = createdWall.get_Parameter(BuiltInParameter.WALL_TOP_OFFSET);
+                            if (pTopOffset != null && !pTopOffset.IsReadOnly) pTopOffset.Set(0.0);
+                        }
+                        else
+                        {
+                            Parameter pTopLvl = createdWall.get_Parameter(BuiltInParameter.WALL_HEIGHT_TYPE);
+                            if (pTopLvl != null && !pTopLvl.IsReadOnly)
+                            {
+                                try { pTopLvl.Set(ElementId.InvalidElementId); } catch { }
+                            }
+                            Parameter pUnconnectedH = createdWall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM);
+                            if (pUnconnectedH != null && !pUnconnectedH.IsReadOnly)
+                            {
+                                try { pUnconnectedH.Set(wallHeight); } catch { }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    Parameter pTopOffset = createdWall.get_Parameter(BuiltInParameter.WALL_TOP_OFFSET);
+                    if (pTopOffset != null && !pTopOffset.IsReadOnly) pTopOffset.Set(0.0);
+                }
+
+                EnableStructuralParameter(createdWall);
+
+                CopyLocalisationValueSmart(linkWall, createdWall);
+
+                linkWallToHostWallMap[linkWall.Id] = createdWall;
+                createdHostWalls.Add(createdWall);
+                wallsRebuilt++;
+            }
+        }
+
+        foreach (Wall hw in existingHostWalls)
+        {
+            if (hw != null && HasStructuralLayer(hw))
+            {
+                EnableStructuralParameter(hw);
+            }
+        }
+
+        List<FamilyInstance> linkColumns = new FilteredElementCollector(linkDoc)
+            .OfCategory(BuiltInCategory.OST_StructuralColumns)
+            .OfClass(typeof(FamilyInstance))
+            .Cast<FamilyInstance>()
+            .Where(c => c.Symbol != null && !c.Symbol.Family.Name.ToUpperInvariant().Contains("ARCHI") && !c.Symbol.Name.ToUpperInvariant().Contains("DECORATIF"))
+            .ToList();
+
+        List<FamilySymbol> hostColSymbols = new FilteredElementCollector(doc)
+            .OfCategory(BuiltInCategory.OST_StructuralColumns)
+            .OfClass(typeof(FamilySymbol))
+            .Cast<FamilySymbol>()
+            .ToList();
+
+        int colStep = 0;
+        foreach (FamilyInstance linkCol in linkColumns)
+        {
+            CheckCancellationRequested();
+            colStep++;
+            ProgressUpdate($"Reconstruction Poteaux, {colStep} / {linkColumns.Count}", colStep, linkColumns.Count);
+
+            XYZ colPt = GetElementLocationPoint(linkCol, totalTransform);
+            if (colPt == null) continue;
+
+            Level hostBaseLvl = linkLevelToHostStructLevel.TryGetValue(linkCol.LevelId, out var hL) ? hL : hostStructLevels.FirstOrDefault();
+            if (hostBaseLvl == null) continue;
+
+            bool isWood = IsWoodElement(linkCol);
+            if (isWood) woodColsPreserved++;
+
+            double bValFt = 0, hValFt = 0, dValFt = 0;
+            Parameter pb = linkCol.Symbol != null ? linkCol.Symbol.LookupParameter("b") : null;
+            Parameter ph = linkCol.Symbol != null ? linkCol.Symbol.LookupParameter("h") : null;
+            Parameter pd = linkCol.Symbol != null ? linkCol.Symbol.LookupParameter("d") : null;
+
+            if (pb != null && pb.HasValue) bValFt = pb.AsDouble();
+            if (ph != null && ph.HasValue) hValFt = ph.AsDouble();
+            if (pd != null && pd.HasValue) dValFt = pd.AsDouble();
+
+            double bMM = UnitUtils.ConvertFromInternalUnits(bValFt, UnitTypeId.Millimeters);
+            double hMM = UnitUtils.ConvertFromInternalUnits(hValFt, UnitTypeId.Millimeters);
+            double dMM = UnitUtils.ConvertFromInternalUnits(dValFt, UnitTypeId.Millimeters);
+
+            bool isRound = linkCol.Symbol != null && linkCol.Symbol.Family.Name.IndexOf("Rond", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            FamilySymbol targetSym = null;
+            if (isRound)
+            {
+                if (dMM <= 0) dMM = 400;
+                string roundName = $"Φ{(int)Math.Round(dMM)}";
+                targetSym = hostColSymbols.FirstOrDefault(s => string.Equals(s.Family.Name, "STR_PT_T1_CSP_01_P2", StringComparison.OrdinalIgnoreCase) && string.Equals(s.Name, roundName, StringComparison.OrdinalIgnoreCase));
+                if (targetSym == null)
+                {
+                    FamilySymbol baseR = hostColSymbols.FirstOrDefault(s => string.Equals(s.Family.Name, "STR_PT_T1_CSP_01_P2", StringComparison.OrdinalIgnoreCase));
+                    if (baseR != null)
+                    {
+                        targetSym = baseR.Duplicate(roundName) as FamilySymbol;
+                        if (targetSym != null)
+                        {
+                            Parameter pD = targetSym.LookupParameter("ECS_d");
+                            if (pD != null && !pD.IsReadOnly) pD.Set(dValFt > 0 ? dValFt : (pb != null && pb.HasValue ? pb.AsDouble() : 0));
+                            hostColSymbols.Add(targetSym);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if (bMM <= 0) bMM = 200;
+                if (hMM <= 0) hMM = bMM;
+
+                string rectName = $"{(int)Math.Round(bMM)}x{(int)Math.Round(hMM)}";
+                targetSym = hostColSymbols.FirstOrDefault(s => string.Equals(s.Family.Name, "STR_PT_T1_CSP_01_P1", StringComparison.OrdinalIgnoreCase) && string.Equals(s.Name, rectName, StringComparison.OrdinalIgnoreCase));
+                if (targetSym == null)
+                {
+                    FamilySymbol baseRect = hostColSymbols.FirstOrDefault(s => string.Equals(s.Family.Name, "STR_PT_T1_CSP_01_P1", StringComparison.OrdinalIgnoreCase));
+                    if (baseRect != null)
+                    {
+                        targetSym = baseRect.Duplicate(rectName) as FamilySymbol;
+                        if (targetSym != null)
+                        {
+                            Parameter pEcsB = targetSym.LookupParameter("ECS_b");
+                            Parameter pEcsH = targetSym.LookupParameter("ECS_h");
+                            if (pEcsB != null && !pEcsB.IsReadOnly) pEcsB.Set(bValFt);
+                            if (pEcsH != null && !pEcsH.IsReadOnly) pEcsH.Set(hValFt > 0 ? hValFt : bValFt);
+                            hostColSymbols.Add(targetSym);
+                        }
+                    }
+                }
+            }
+
+            if (targetSym == null)
+            {
+                targetSym = hostColSymbols.FirstOrDefault(s => s.Family.Name.StartsWith("STR_PT_T", StringComparison.OrdinalIgnoreCase)) ?? hostColSymbols.FirstOrDefault();
+            }
+
+            FamilyInstance createdCol = existingHostColumns.FirstOrDefault(hc => {
+                XYZ hPt = GetElementLocationPoint(hc, Transform.Identity);
+                return hPt != null && Math.Sqrt(Math.Pow(hPt.X - colPt.X, 2) + Math.Pow(hPt.Y - colPt.Y, 2)) < 0.5 && hc.LevelId == hostBaseLvl.Id;
+            });
+
+            if (createdCol != null)
+            {
+                if (targetSym != null)
+                {
+                    try
+                    {
+                        if (!targetSym.IsActive) targetSym.Activate();
+                        createdCol.ChangeTypeId(targetSym.Id);
+                    }
+                    catch { }
+                }
+            }
+            else
+            {
+                if (targetSym != null)
+                {
+                    try
+                    {
+                        if (!targetSym.IsActive) targetSym.Activate();
+                        createdCol = doc.Create.NewFamilyInstance(colPt, targetSym, hostBaseLvl, Autodesk.Revit.DB.Structure.StructuralType.Column);
+                        if (createdCol != null) existingHostColumns.Add(createdCol);
+                    }
+                    catch { }
+                }
+            }
+
+            if (createdCol != null)
+            {
+                Parameter pBaseOff = createdCol.get_Parameter(BuiltInParameter.FAMILY_BASE_LEVEL_OFFSET_PARAM);
+                if (pBaseOff != null && !pBaseOff.IsReadOnly) pBaseOff.Set(0.0);
+
+                Parameter pElevOff = createdCol.get_Parameter(BuiltInParameter.INSTANCE_ELEVATION_PARAM);
+                if (pElevOff != null && !pElevOff.IsReadOnly) pElevOff.Set(0.0);
+
+                Parameter pTopOff = createdCol.get_Parameter(BuiltInParameter.FAMILY_TOP_LEVEL_OFFSET_PARAM);
+                if (pTopOff != null && !pTopOff.IsReadOnly) pTopOff.Set(0.0);
+
+                CopyLocalisationValueSmart(linkCol, createdCol);
+                columnsRebuilt++;
+            }
+        }
+
+        FamilySymbol stdColSym = hostColSymbols.FirstOrDefault(s => string.Equals(s.Family.Name, "STR_PT_T1_CSP_01_P1", StringComparison.OrdinalIgnoreCase) && string.Equals(s.Name, "40x40", StringComparison.OrdinalIgnoreCase))
+            ?? hostColSymbols.FirstOrDefault(s => s.Family.Name.StartsWith("STR_PT_T", StringComparison.OrdinalIgnoreCase));
+
+        foreach (FamilyInstance hc in existingHostColumns)
+        {
+            if (hc != null && hc.Symbol != null && hc.Symbol.Family.Name.Contains("INT1") && stdColSym != null)
+            {
+                try { hc.ChangeTypeId(stdColSym.Id); } catch { }
+            }
+
+            Parameter pElev = hc.get_Parameter(BuiltInParameter.INSTANCE_ELEVATION_PARAM);
+            if (pElev != null && !pElev.IsReadOnly) pElev.Set(0.0);
+
+            Parameter pBaseOff = hc.get_Parameter(BuiltInParameter.FAMILY_BASE_LEVEL_OFFSET_PARAM);
+            if (pBaseOff != null && !pBaseOff.IsReadOnly) pBaseOff.Set(0.0);
+
+            Parameter pTopOff = hc.get_Parameter(BuiltInParameter.FAMILY_TOP_LEVEL_OFFSET_PARAM);
+            if (pTopOff != null && !pTopOff.IsReadOnly) pTopOff.Set(0.0);
+        }
+
+        List<Element> linkShaftOpenings = new FilteredElementCollector(linkDoc)
+            .OfCategory(BuiltInCategory.OST_ShaftOpening)
+            .WhereElementIsNotElementType()
+            .ToList();
+
+        List<Element> existingHostShafts = new FilteredElementCollector(doc)
+            .OfCategory(BuiltInCategory.OST_ShaftOpening)
+            .WhereElementIsNotElementType()
+            .ToList();
+
+        CopyPasteOptions copyShaftOpts = new CopyPasteOptions();
+        copyShaftOpts.SetDuplicateTypeNamesHandler(new DuplicateTypeNamesHandler());
+
+        foreach (Element shaft in linkShaftOpenings)
+        {
+            CheckCancellationRequested();
+            BoundingBoxXYZ sBb = shaft.get_BoundingBox(null);
+            XYZ sCentroid = sBb != null ? totalTransform.OfPoint((sBb.Min + sBb.Max) * 0.5) : null;
+
+            bool existsInHost = false;
+            if (sCentroid != null)
+            {
+                foreach (Element hs in existingHostShafts)
+                {
+                    BoundingBoxXYZ hBb = hs.get_BoundingBox(null);
+                    if (hBb != null)
+                    {
+                        XYZ hCentroid = (hBb.Min + hBb.Max) * 0.5;
+                        if (hCentroid.DistanceTo(sCentroid) < 1.0)
+                        {
+                            existsInHost = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!existsInHost)
+            {
+                try
+                {
+                    ICollection<ElementId> copiedIds = ElementTransformUtils.CopyElements(linkDoc, new List<ElementId> { shaft.Id }, doc, totalTransform, copyShaftOpts);
+                    if (copiedIds != null && copiedIds.Count > 0)
+                    {
+                        shaftsRebuilt++;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        List<Floor> linkFloors = new FilteredElementCollector(linkDoc)
+            .OfClass(typeof(Floor))
+            .Cast<Floor>()
+            .Where(f => f.FloorType != null && HasStructuralLayerFloor(f))
+            .ToList();
+
+        existingHostFloors = new FilteredElementCollector(doc)
+            .OfClass(typeof(Floor))
+            .Cast<Floor>()
+            .ToList();
+
+        Dictionary<Floor, XYZ> hostFloorCentroids = new Dictionary<Floor, XYZ>();
+        foreach (Floor hf in existingHostFloors)
+        {
+            CheckCancellationRequested();
+            BoundingBoxXYZ bb = hf.get_BoundingBox(null);
+            if (bb != null) hostFloorCentroids[hf] = (bb.Min + bb.Max) * 0.5;
+        }
+
+        int flrStep = 0;
+        foreach (Floor linkFlr in linkFloors)
+        {
+            CheckCancellationRequested();
+            flrStep++;
+            ProgressUpdate($"Reconstruction Dalles, {flrStep} / {linkFloors.Count}", flrStep, linkFloors.Count);
+
+            bool isExterior = IsExteriorByLocalisationOrKeyword(linkFlr);
+
+            BoundingBoxXYZ linkBb = linkFlr.get_BoundingBox(null);
+            XYZ linkCentroid = linkBb != null ? totalTransform.OfPoint((linkBb.Min + linkBb.Max) * 0.5) : null;
+
+            Floor createdFloor = null;
+            if (linkCentroid != null)
+            {
+                var kvp = hostFloorCentroids.FirstOrDefault(x => x.Value.DistanceTo(linkCentroid) < 3.0);
+                if (kvp.Key != null)
+                {
+                    createdFloor = kvp.Key;
+                }
+            }
+
+            if (createdFloor != null && HasInnerLoops(linkFlr) && !HasInnerLoops(createdFloor))
+            {
+                try
+                {
+                    doc.Delete(createdFloor.Id);
+                    hostFloorCentroids.Remove(createdFloor);
+                    createdFloor = null;
+                }
+                catch { }
+            }
+
+            if (createdFloor == null)
+            {
+                try
+                {
+                    CopyPasteOptions options = new CopyPasteOptions();
+                    options.SetDuplicateTypeNamesHandler(new DuplicateTypeNamesHandler());
+                    ICollection<ElementId> copiedIds = ElementTransformUtils.CopyElements(linkDoc, new List<ElementId> { linkFlr.Id }, doc, totalTransform, options);
+                    if (copiedIds != null && copiedIds.Count > 0)
+                    {
+                        createdFloor = doc.GetElement(copiedIds.First()) as Floor;
+                        if (createdFloor != null && linkCentroid != null)
+                        {
+                            hostFloorCentroids[createdFloor] = linkCentroid;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (createdFloor != null)
+            {
+                double thick = linkFlr.FloorType?.GetCompoundStructure()?.GetWidth()
+                            ?? createdFloor.FloorType?.GetCompoundStructure()?.GetWidth()
+                            ?? UnitUtils.ConvertToInternalUnits(20, UnitTypeId.Centimeters);
+
+                FloorType targetType = GetOrCreateStrFloorType(doc, thick, isExterior);
+                if (targetType != null && createdFloor.IsValidType(targetType.Id))
+                {
+                    try { createdFloor.ChangeTypeId(targetType.Id); } catch { }
+                }
+
+                if (linkLevelToHostStructLevel.TryGetValue(linkFlr.LevelId, out Level hostLevel))
+                {
+                    Parameter pLevel = createdFloor.get_Parameter(BuiltInParameter.LEVEL_PARAM);
+                    if (pLevel != null && !pLevel.IsReadOnly)
+                    {
+                        try { pLevel.Set(hostLevel.Id); } catch { }
+                    }
+                }
+
+                Parameter pOff = createdFloor.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);
+                if (pOff != null && !pOff.IsReadOnly) pOff.Set(0.0);
+
+                EnableStructuralParameter(createdFloor);
+
+                CopyLocalisationValueSmart(linkFlr, createdFloor);
+                floorsRebuilt++;
+            }
+        }
+
+        List<Floor> remainingHostFloors = new FilteredElementCollector(doc)
+            .OfClass(typeof(Floor))
+            .Cast<Floor>()
+            .Where(f => f.FloorType != null && !f.FloorType.Name.StartsWith("STR_", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        foreach (Floor hf in remainingHostFloors)
+        {
+            CheckCancellationRequested();
+            double thick = hf.FloorType?.GetCompoundStructure()?.GetWidth() 
+                        ?? UnitUtils.ConvertToInternalUnits(20, UnitTypeId.Centimeters);
+            bool isExterior = IsExteriorByLocalisationOrKeyword(hf);
+            FloorType targetType = GetOrCreateStrFloorType(doc, thick, isExterior);
+            if (targetType != null && hf.IsValidType(targetType.Id))
+            {
+                try { hf.ChangeTypeId(targetType.Id); } catch { }
+            }
+            EnableStructuralParameter(hf);
+        }
+
+        foreach (Floor hf in existingHostFloors)
+        {
+            if (hf != null && HasStructuralLayerFloor(hf))
+            {
+                EnableStructuralParameter(hf);
+            }
+        }
+
+        List<FamilyInstance> linkDoors = new FilteredElementCollector(linkDoc)
+            .OfCategory(BuiltInCategory.OST_Doors)
+            .OfClass(typeof(FamilyInstance))
+            .Cast<FamilyInstance>()
+            .ToList();
+
+        int doorStep = 0;
+        foreach (FamilyInstance linkDoor in linkDoors)
+        {
+            CheckCancellationRequested();
+            doorStep++;
+            ProgressUpdate($"Convert Portes STR, {doorStep} / {linkDoors.Count}", doorStep, linkDoors.Count);
+
+            XYZ doorPt = GetElementLocationPoint(linkDoor, totalTransform);
+            if (doorPt == null) continue;
+
+            Wall hostWall = null;
+            if (linkDoor.Host is Wall linkHostW && linkWallToHostWallMap.TryGetValue(linkHostW.Id, out var mappedW))
+            {
+                hostWall = mappedW;
+            }
+
+            if (hostWall == null && createdHostWalls.Count > 0)
+            {
+                double minDist = double.MaxValue;
+                Wall bestW = null;
+                foreach (Wall w in createdHostWalls)
+                {
+                    if (w.Location is LocationCurve lc)
+                    {
+                        double d = lc.Curve.Distance(doorPt);
+                        if (d < minDist)
+                        {
+                            minDist = d;
+                            bestW = w;
+                        }
+                    }
+                }
+                if (minDist <= 2.5) hostWall = bestW;
+            }
+
+            if (hostWall == null) continue;
+
+            Level hostLevel = linkLevelToHostStructLevel.TryGetValue(linkDoor.LevelId, out var hL) ? hL : hostStructLevels.FirstOrDefault();
+            if (hostLevel == null) continue;
+
+            bool isExterior = IsExteriorByLocalisationOrKeyword(linkDoor);
+            FamilySymbol doorSym = GetOrCreateStrDoorSymbol(doc, linkDoc, linkDoor, isExterior);
+            if (doorSym == null) continue;
+
+            XYZ placePt = doorPt;
+            if (hostWall.Location is LocationCurve hostLc)
+            {
+                IntersectionResult proj = hostLc.Curve.Project(doorPt);
+                if (proj != null) placePt = proj.XYZPoint;
+            }
+
+            FamilyInstance newDoor = existingHostDoors.FirstOrDefault(hd => {
+                XYZ hPt = GetElementLocationPoint(hd, Transform.Identity);
+                return hPt != null && hPt.DistanceTo(placePt) < 0.5;
+            });
+
+            if (newDoor == null)
+            {
+                try
+                {
+                    if (!doorSym.IsActive) doorSym.Activate();
+                    newDoor = doc.Create.NewFamilyInstance(placePt, doorSym, hostWall, hostLevel, Autodesk.Revit.DB.Structure.StructuralType.NonStructural);
+                    if (newDoor != null) existingHostDoors.Add(newDoor);
+                }
+                catch { }
+            }
+            else
+            {
+                if (doorSym != null)
+                {
+                    try
+                    {
+                        if (!doorSym.IsActive) doorSym.Activate();
+                        newDoor.ChangeTypeId(doorSym.Id);
+                    }
+                    catch { }
+                }
+            }
+
+            if (newDoor != null)
+            {
+                Parameter pSill = linkDoor.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM);
+                if (pSill != null && pSill.HasValue)
+                {
+                    Parameter pNewSill = newDoor.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM);
+                    if (pNewSill != null && !pNewSill.IsReadOnly)
+                    {
+                        try { pNewSill.Set(pSill.AsDouble()); } catch { }
+                    }
+                }
+
+                CopyLocalisationValueSmart(linkDoor, newDoor);
+                doorsRebuilt++;
+            }
+        }
+
+        List<FamilyInstance> linkWinList = new FilteredElementCollector(linkDoc)
+            .OfCategory(BuiltInCategory.OST_Windows)
+            .OfClass(typeof(FamilyInstance))
+            .Cast<FamilyInstance>()
+            .ToList();
+
+        int winStep = 0;
+        foreach (FamilyInstance linkWin in linkWinList)
+        {
+            CheckCancellationRequested();
+            winStep++;
+            ProgressUpdate($"Convert Fenêtres STR, {winStep} / {linkWinList.Count}", winStep, linkWinList.Count);
+
+            XYZ winPt = GetElementLocationPoint(linkWin, totalTransform);
+            if (winPt == null) continue;
+
+            Wall hostWall = null;
+            if (linkWin.Host is Wall linkHostW && linkWallToHostWallMap.TryGetValue(linkHostW.Id, out var mappedW))
+            {
+                hostWall = mappedW;
+            }
+
+            if (hostWall == null && createdHostWalls.Count > 0)
+            {
+                double minDist = double.MaxValue;
+                Wall bestW = null;
+                foreach (Wall w in createdHostWalls)
+                {
+                    if (w.Location is LocationCurve lc)
+                    {
+                        double d = lc.Curve.Distance(winPt);
+                        if (d < minDist)
+                        {
+                            minDist = d;
+                            bestW = w;
+                        }
+                    }
+                }
+                if (minDist <= 2.5) hostWall = bestW;
+            }
+
+            if (hostWall == null) continue;
+
+            Level hostLevel = linkLevelToHostStructLevel.TryGetValue(linkWin.LevelId, out var hL) ? hL : hostStructLevels.FirstOrDefault();
+            if (hostLevel == null) continue;
+
+            bool isExterior = IsExteriorByLocalisationOrKeyword(linkWin);
+            FamilySymbol winSym = GetOrCreateStrWinSymbol(doc, linkDoc, linkWin, isExterior);
+            if (winSym == null) continue;
+
+            XYZ placePt = winPt;
+            if (hostWall.Location is LocationCurve hostLc)
+            {
+                IntersectionResult proj = hostLc.Curve.Project(winPt);
+                if (proj != null) placePt = proj.XYZPoint;
+            }
+
+            FamilyInstance newWin = existingHostWindows.FirstOrDefault(hw => {
+                XYZ hPt = GetElementLocationPoint(hw, Transform.Identity);
+                return hPt != null && hPt.DistanceTo(placePt) < 0.5;
+            });
+
+            if (newWin == null)
+            {
+                try
+                {
+                    if (!winSym.IsActive) winSym.Activate();
+                    newWin = doc.Create.NewFamilyInstance(placePt, winSym, hostWall, hostLevel, Autodesk.Revit.DB.Structure.StructuralType.NonStructural);
+                    if (newWin != null) existingHostWindows.Add(newWin);
+                }
+                catch { }
+            }
+            else
+            {
+                if (winSym != null)
+                {
+                    try
+                    {
+                        if (!winSym.IsActive) winSym.Activate();
+                        newWin.ChangeTypeId(winSym.Id);
+                    }
+                    catch { }
+                }
+            }
+
+            if (newWin != null)
+            {
+                Parameter pSill = linkWin.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM);
+                if (pSill != null && pSill.HasValue)
+                {
+                    Parameter pNewSill = newWin.get_Parameter(BuiltInParameter.INSTANCE_SILL_HEIGHT_PARAM);
+                    if (pNewSill != null && !pNewSill.IsReadOnly)
+                    {
+                        try { pNewSill.Set(pSill.AsDouble()); } catch { }
+                    }
+                }
+
+                CopyLocalisationValueSmart(linkWin, newWin);
+                windowsRebuilt++;
+            }
+        }
+
+        List<FamilyInstance> allHostDoorsAndWindows = new FilteredElementCollector(doc)
+            .WherePasses(new ElementMulticategoryFilter(new List<BuiltInCategory> { BuiltInCategory.OST_Doors, BuiltInCategory.OST_Windows }))
+            .WhereElementIsNotElementType()
+            .OfClass(typeof(FamilyInstance))
+            .Cast<FamilyInstance>()
+            .ToList();
+
+        int dwIndex = 0;
+        foreach (FamilyInstance inst in allHostDoorsAndWindows)
+        {
+            CheckCancellationRequested();
+            dwIndex++;
+            ProgressUpdate($"Synchronisation INT/EXT portes & fenêtres, {dwIndex} / {allHostDoorsAndWindows.Count}", dwIndex, allHostDoorsAndWindows.Count);
+
+            Wall host = inst.Host as Wall;
+            if (host == null) continue;
+
+            string wallName = host.WallType.Name.ToUpper();
+            string wallLoc = (host.LookupParameter("013EC_Localisation")?.AsString() ?? "").ToUpper();
+
+            bool isInt = wallName.Contains("_INT") || wallLoc.Contains("INT") || wallLoc.Contains("INTERIEUR");
+            bool isExt = wallName.Contains("_EXT") || wallLoc.Contains("EXT") || wallLoc.Contains("EXTERIEUR") || wallLoc.Contains("FACADE");
+
+            string targetKind = isInt ? "INT" : "EXT";
+            string targetLocalisation = isInt ? "INTERIEUR" : "EXTERIEUR";
+
+            FamilySymbol curSymbol = inst.Symbol;
+            string curSymName = curSymbol.Name;
+
+            string targetSuffix = "_" + targetKind;
+            string oldSuffix = isInt ? "_EXT" : "_INT";
+
+            if (curSymName.EndsWith(oldSuffix))
+            {
+                string targetSymName = curSymName.Substring(0, curSymName.Length - oldSuffix.Length) + targetSuffix;
+
+                FamilySymbol targetSymbol = curSymbol.Family.GetFamilySymbolIds()
+                    .Select(id => doc.GetElement(id) as FamilySymbol)
+                    .FirstOrDefault(fs => fs != null && fs.Name.Equals(targetSymName, StringComparison.OrdinalIgnoreCase));
+
+                if (targetSymbol == null)
+                {
+                    targetSymbol = curSymbol.Duplicate(targetSymName) as FamilySymbol;
+                    if (targetSymbol != null && !targetSymbol.IsActive) targetSymbol.Activate();
+                }
+
+                if (targetSymbol != null)
+                {
+                    try { inst.Symbol = targetSymbol; } catch { }
+                }
+            }
+            else if (!curSymName.EndsWith(targetSuffix))
+            {
+                string targetSymName = curSymName + targetSuffix;
+
+                FamilySymbol targetSymbol = curSymbol.Family.GetFamilySymbolIds()
+                    .Select(id => doc.GetElement(id) as FamilySymbol)
+                    .FirstOrDefault(fs => fs != null && fs.Name.Equals(targetSymName, StringComparison.OrdinalIgnoreCase));
+
+                if (targetSymbol == null)
+                {
+                    targetSymbol = curSymbol.Duplicate(targetSymName) as FamilySymbol;
+                    if (targetSymbol != null && !targetSymbol.IsActive) targetSymbol.Activate();
+                }
+
+                if (targetSymbol != null)
+                {
+                    try { inst.Symbol = targetSymbol; } catch { }
+                }
+            }
+
+            Parameter pLoc = inst.LookupParameter("013EC_Localisation");
+            if (pLoc != null && !pLoc.IsReadOnly && pLoc.AsString() != targetLocalisation)
+            {
+                try { pLoc.Set(targetLocalisation); } catch { }
+            }
+
+            Parameter pFunc = inst.LookupParameter("03_ECS_Detail_Fonction");
+            if (pFunc != null && !pFunc.IsReadOnly && pFunc.AsString() != targetKind)
+            {
+                try { pFunc.Set(targetKind); } catch { }
+            }
+
+            Parameter pTypeHote = inst.LookupParameter("*303EC_TypeHote");
+            if (pTypeHote != null && !pTypeHote.IsReadOnly && pTypeHote.AsString() != targetKind)
+            {
+                try { pTypeHote.Set(targetKind); } catch { }
+            }
+        }
+
+        t.Commit();
+    }
+
+Logger.AppendLine($"Reconstruction terminée (Mode Idempotent) : {wallsRebuilt} voiles structurels, {columnsRebuilt} poteaux, {floorsRebuilt} dalles, {doorsRebuilt} portes, {windowsRebuilt} fenêtres.");
+
+    return new Output
+    {
+        Success = true,
+        WallsRebuilt = wallsRebuilt,
+        ColumnsRebuilt = columnsRebuilt,
+        FloorsRebuilt = floorsRebuilt,
+        DoorsRebuilt = doorsRebuilt,
+        WindowsRebuilt = windowsRebuilt,
+        WoodWallsPreserved = woodWallsPreserved,
+        WoodColsPreserved = woodColsPreserved,
+        LinkTitle = linkDoc.Title
+    };
+}

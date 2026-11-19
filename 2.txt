@@ -1,0 +1,153 @@
+class Inputs
+{
+    public string Action { get; set; }
+}
+
+class Output
+{
+    public bool Success { get; set; }
+    public int ConvertedCount { get; set; }
+    public int IntOffsetCount { get; set; }
+    public int ExtOffsetCount { get; set; }
+    public string Message { get; set; }
+}
+
+/// <summary>
+/// Exécute la fonction sélectionnée : conversion des voiles ASC/ESC en EXT ou ajustement des décalages d'arase INT/EXT.
+/// </summary>
+/// <param name="input">Action à exécuter ("convert_asc_ext" ou "apply_offsets").</param>
+/// <returns>Le résultat détaillé de l'exécution.</returns>
+Output Run(Inputs input)
+{
+    Document doc = UIDoc.Document;
+    int convertedCount = 0;
+    int intOffsetCount = 0;
+    int extOffsetCount = 0;
+
+    var allWallTypes = new FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_Walls)
+        .WhereElementIsElementType()
+        .Cast<WallType>()
+        .ToDictionary(wt => wt.Name, wt => wt, StringComparer.OrdinalIgnoreCase);
+
+    var allWalls = new FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_Walls)
+        .WhereElementIsNotElementType()
+        .Cast<Wall>()
+        .ToList();
+
+    string action = input.Action ?? "convert_asc_ext";
+
+    using (Transaction t = new Transaction(doc, "[argus] " + (action == "convert_asc_ext" ? "Conversion voiles ASC/ESC en EXT" : "Ajustement décalages INT/EXT")))
+    {
+        t.Start();
+
+        if (action == "convert_asc_ext")
+        {
+            foreach (var w in allWalls)
+            {
+                CheckCancellationRequested();
+                var bb = w.get_BoundingBox(null);
+                if (bb == null) continue;
+                double cx = (bb.Min.X + bb.Max.X) / 2;
+                double cy = (bb.Min.Y + bb.Max.Y) / 2;
+
+                if (cx >= 422 && cx <= 445 && cy >= -60 && cy <= -30)
+                {
+                    bool isASC_North = Math.Abs(cy - (-40.32)) < 0.8 && cx >= 432.0 && cx <= 443.5;
+                    bool isASC_South = Math.Abs(cy - (-50.33)) < 0.8 && cx >= 432.0 && cx <= 443.5;
+                    bool isASC_East  = Math.Abs(cx - 442.84) < 0.8 && cy >= -51.5 && cy <= -35.0;
+
+                    bool isESC_North = Math.Abs(cy - (-40.81)) < 0.8 && cx >= 425.5 && cx <= 433.5;
+                    bool isESC_South = Math.Abs(cy - (-51.84)) < 0.8 && cx >= 425.5 && cx <= 433.5;
+                    bool isESC_West  = Math.Abs(cx - 426.83) < 0.8 && cy >= -52.5 && cy <= -39.5;
+
+                    bool isCommon_WestASC_EastESC = Math.Abs(cx - 432.90) < 0.8 && cy >= -52.5 && cy <= -39.5;
+
+                    if (isASC_North || isASC_South || isASC_East || isESC_North || isESC_South || isESC_West || isCommon_WestASC_EastESC)
+                    {
+                        string currentName = w.WallType.Name;
+                        if (currentName.Contains("_INT"))
+                        {
+                            string targetName = currentName.Replace("_INT", "_EXT");
+                            if (allWallTypes.TryGetValue(targetName, out WallType targetType))
+                            {
+                                w.WallType = targetType;
+                                convertedCount++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else if (action == "apply_offsets")
+        {
+            var allFloors = new FilteredElementCollector(doc)
+                .OfCategory(BuiltInCategory.OST_Floors)
+                .WhereElementIsNotElementType()
+                .Cast<Floor>()
+                .ToList();
+
+            var levelSlabThickMap = new Dictionary<ElementId, double>();
+            foreach (var f in allFloors)
+            {
+                var cs = f.FloorType.GetCompoundStructure();
+                if (cs != null)
+                {
+                    double th = cs.GetWidth();
+                    if (!levelSlabThickMap.ContainsKey(f.LevelId) || th > levelSlabThickMap[f.LevelId])
+                    {
+                        levelSlabThickMap[f.LevelId] = th;
+                    }
+                }
+            }
+
+            foreach (var w in allWalls)
+            {
+                CheckCancellationRequested();
+                string name = w.WallType.Name;
+                Parameter paramBase = w.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET);
+                Parameter paramTop  = w.get_Parameter(BuiltInParameter.WALL_TOP_OFFSET);
+                ElementId topLvlId  = w.get_Parameter(BuiltInParameter.WALL_HEIGHT_TYPE)?.AsElementId() ?? ElementId.InvalidElementId;
+
+                if (name.Contains("_INT"))
+                {
+                    double slabTh = 0;
+                    if (topLvlId != ElementId.InvalidElementId && levelSlabThickMap.TryGetValue(topLvlId, out double th))
+                    {
+                        slabTh = th;
+                    }
+                    else
+                    {
+                        slabTh = UnitUtils.ConvertToInternalUnits(20, UnitTypeId.Centimeters);
+                    }
+
+                    if (paramBase != null && !paramBase.IsReadOnly) paramBase.Set(0.0);
+                    if (paramTop != null && !paramTop.IsReadOnly) paramTop.Set(-slabTh);
+                    intOffsetCount++;
+                }
+                else if (name.Contains("_EXT"))
+                {
+                    if (paramBase != null && !paramBase.IsReadOnly) paramBase.Set(0.0);
+                    if (paramTop != null && !paramTop.IsReadOnly) paramTop.Set(0.0);
+                    extOffsetCount++;
+                }
+            }
+        }
+
+        t.Commit();
+    }
+
+    string msg = action == "convert_asc_ext"
+        ? $"Conversion terminée : {convertedCount} voiles de la cage ASC/ESC ont été passés en EXT."
+        : $"Ajustement des arases terminé : {intOffsetCount} voiles INT (TopOffset = -épaiss. dalle) et {extOffsetCount} voiles EXT (TopOffset = 0) ajustés.";
+
+    return new Output
+    {
+        Success = true,
+        ConvertedCount = convertedCount,
+        IntOffsetCount = intOffsetCount,
+        ExtOffsetCount = extOffsetCount,
+        Message = msg
+    };
+}

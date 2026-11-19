@@ -1,0 +1,948 @@
+class Inputs
+{
+    public string Scope { get; set; }
+    public string AlignTo { get; set; }
+    public string Action { get; set; }
+    public string SplitRef { get; set; }
+}
+
+class FloorResult
+{
+    public string Id { get; set; }
+    public string Name { get; set; }
+    public string Level { get; set; }
+    public string Status { get; set; }
+}
+
+class Output
+{
+    public int UpdatedCount { get; set; }
+    public int SkippedCount { get; set; }
+    public FloorResult[] Floors { get; set; }
+}
+
+class Pt2D
+{
+    public double X, Y;
+    public Pt2D(double x, double y)
+    {
+        X = Math.Round(x, 4);
+        Y = Math.Round(y, 4);
+    }
+    public double Dist(Pt2D o) => Math.Sqrt((X - o.X) * (X - o.X) + (Y - o.Y) * (Y - o.Y));
+}
+
+class Seg2D
+{
+    public Pt2D P1, P2;
+    public Seg2D(Pt2D p1, Pt2D p2)
+    {
+        P1 = p1; P2 = p2;
+    }
+}
+
+class DirEdge
+{
+    public int From, To;
+    public double Angle;
+    public DirEdge(int f, int t, double a) { From = f; To = t; Angle = a; }
+}
+
+/// <summary>Aligns floor slab contours to structural wall faces/centerline or splits floors along structural walls.</summary>
+/// <param name="input">Action (split or align), Scope, AlignTo mode (interior, axis, exterior), and SplitRef mode (axis or contact).</param>
+/// <returns>Summary of created/updated and skipped floors with details.</returns>
+Output Run(Inputs input)
+{
+    Document doc = UIDoc.Document;
+    UIDocument uiDoc = UIDoc;
+
+    List<Floor> targetFloors = new List<Floor>();
+    string scope = input.Scope != null ? input.Scope.ToLower() : "view";
+    string alignTo = input.AlignTo != null ? input.AlignTo.ToLower() : "interior";
+    string action = input.Action != null ? input.Action.ToLower() : "split";
+    string splitRef = input.SplitRef != null ? input.SplitRef.ToLower() : "axis";
+
+    if (scope == "selected")
+    {
+        ICollection<ElementId> selectedIds = uiDoc.Selection.GetElementIds();
+        foreach (ElementId id in selectedIds)
+        {
+            Element elem = doc.GetElement(id);
+            if (elem is Floor f) targetFloors.Add(f);
+        }
+    }
+    else if (scope == "project")
+    {
+        targetFloors = new FilteredElementCollector(doc)
+            .OfCategory(BuiltInCategory.OST_Floors)
+            .WhereElementIsNotElementType()
+            .Cast<Floor>()
+            .ToList();
+    }
+    else
+    {
+        ElementId activeViewId = uiDoc.GetOpenUIViews()[0].ViewId;
+        targetFloors = new FilteredElementCollector(doc, activeViewId)
+            .OfCategory(BuiltInCategory.OST_Floors)
+            .WhereElementIsNotElementType()
+            .Cast<Floor>()
+            .ToList();
+    }
+
+    if (targetFloors.Count == 0)
+    {
+        Logger.AppendLine("No floors found in the specified scope.");
+        return new Output { UpdatedCount = 0, SkippedCount = 0, Floors = new FloorResult[0] };
+    }
+
+    void CopyInstanceParameters(Floor source, Floor target)
+    {
+        foreach (Parameter srcParam in source.Parameters)
+        {
+            if (srcParam == null || srcParam.Definition == null) continue;
+            if (srcParam.IsReadOnly) continue;
+
+            BuiltInParameter bip = (BuiltInParameter)srcParam.Id.IntegerValue;
+            if (bip == BuiltInParameter.ELEM_FAMILY_PARAM ||
+                bip == BuiltInParameter.ELEM_TYPE_PARAM ||
+                bip == BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM ||
+                bip == BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM ||
+                bip == BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL)
+                continue;
+
+            Parameter tgtParam = target.get_Parameter(srcParam.Definition);
+            if (tgtParam == null || tgtParam.IsReadOnly)
+            {
+                tgtParam = target.LookupParameter(srcParam.Definition.Name);
+            }
+
+            if (tgtParam != null && !tgtParam.IsReadOnly && tgtParam.Definition != null)
+            {
+                try
+                {
+                    switch (srcParam.StorageType)
+                    {
+                        case StorageType.Double:
+                            tgtParam.Set(srcParam.AsDouble());
+                            break;
+                        case StorageType.Integer:
+                            tgtParam.Set(srcParam.AsInteger());
+                            break;
+                        case StorageType.String:
+                            string val = srcParam.AsString();
+                            if (!string.IsNullOrEmpty(val)) tgtParam.Set(val);
+                            break;
+                        case StorageType.ElementId:
+                            ElementId id = srcParam.AsElementId();
+                            if (id != null && id != ElementId.InvalidElementId) tgtParam.Set(id);
+                            break;
+                    }
+                }
+                catch { }
+            }
+        }
+    }
+
+    Pt2D GetSegmentIntersection(Pt2D A, Pt2D B, Pt2D C, Pt2D D)
+    {
+        double det = (B.X - A.X) * (D.Y - C.Y) - (B.Y - A.Y) * (D.X - C.X);
+        if (Math.Abs(det) < 1e-6) return null;
+
+        double t = ((C.X - A.X) * (D.Y - C.Y) - (C.Y - A.Y) * (D.X - C.X)) / det;
+        double u = ((C.X - A.X) * (B.Y - A.Y) - (C.Y - A.Y) * (B.X - A.X)) / det;
+
+        if (t >= -1e-4 && t <= 1 + 1e-4 && u >= -1e-4 && u <= 1 + 1e-4)
+        {
+            return new Pt2D(A.X + t * (B.X - A.X), A.Y + t * (B.Y - A.Y));
+        }
+        return null;
+    }
+
+    Pt2D GetLineIntersectionInfinite(Pt2D A, Pt2D B, Pt2D C, Pt2D D)
+    {
+        double det = (B.X - A.X) * (D.Y - C.Y) - (B.Y - A.Y) * (D.X - C.X);
+        if (Math.Abs(det) < 1e-6) return null;
+
+        double t = ((C.X - A.X) * (D.Y - C.Y) - (C.Y - A.Y) * (D.X - C.X)) / det;
+        return new Pt2D(A.X + t * (B.X - A.X), A.Y + t * (B.Y - A.Y));
+    }
+
+    bool IsPointInPolygon2D(Pt2D pt, List<Pt2D> poly)
+    {
+        bool inside = false;
+        int n = poly.Count;
+        for (int i = 0, j = n - 1; i < n; j = i++)
+        {
+            if (((poly[i].Y > pt.Y) != (poly[j].Y > pt.Y)) &&
+                (pt.X < (poly[j].X - poly[i].X) * (pt.Y - poly[i].Y) / (poly[j].Y - poly[i].Y) + poly[i].X))
+            {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    bool IsPointInsideWallBody(Pt2D pt, Wall w)
+    {
+        LocationCurve wLoc = w.Location as LocationCurve;
+        Line wLine = wLoc?.Curve as Line;
+        if (wLine == null) return false;
+
+        XYZ p0 = wLine.GetEndPoint(0);
+        XYZ p1 = wLine.GetEndPoint(1);
+
+        double dx = p1.X - p0.X;
+        double dy = p1.Y - p0.Y;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 0.01) return false;
+
+        double ux = dx / len;
+        double uy = dy / len;
+        double nx = -uy;
+        double ny = ux;
+
+        double vx = pt.X - p0.X;
+        double vy = pt.Y - p0.Y;
+
+        double projU = vx * ux + vy * uy;
+        double projN = vx * nx + vy * ny;
+
+        double wWidth = w.Width;
+        double halfWidth = wWidth / 2.0;
+
+        double centerOffset = 0.0;
+        Parameter locLineParam = w.get_Parameter(BuiltInParameter.WALL_KEY_REF_PARAM);
+        if (locLineParam != null && locLineParam.Definition != null)
+        {
+            int locVal = locLineParam.AsInteger();
+            if (locVal == 2 || locVal == 4) centerOffset = -halfWidth;
+            else if (locVal == 3 || locVal == 5) centerOffset = halfWidth;
+        }
+
+        double distToCenter = Math.Abs(projN - centerOffset);
+
+        return (distToCenter < halfWidth - 0.01 && projU > 0.01 && projU < len - 0.01);
+    }
+
+    List<Pt2D> ExtractPolyFromCurveArray(CurveArray arr)
+    {
+        List<Pt2D> pts = new List<Pt2D>();
+        foreach (Curve c in arr)
+        {
+            if (c is Line l)
+            {
+                XYZ p = l.GetEndPoint(0);
+                pts.Add(new Pt2D(p.X, p.Y));
+            }
+            else if (c is Arc arc)
+            {
+                int tess = 8;
+                for (int k = 0; k < tess; k++)
+                {
+                    double t = (double)k / tess;
+                    XYZ p = arc.Evaluate(t, true);
+                    pts.Add(new Pt2D(p.X, p.Y));
+                }
+            }
+            else
+            {
+                IList<XYZ> tess = c.Tessellate();
+                for (int k = 0; k < tess.Count - 1; k++)
+                {
+                    pts.Add(new Pt2D(tess[k].X, tess[k].Y));
+                }
+            }
+        }
+        return pts;
+    }
+
+    List<Pt2D> GetFloorTopBoundaryPts(Floor f)
+    {
+        if (f == null) return null;
+        try
+        {
+            Sketch sketch = f.Document.GetElement(f.SketchId) as Sketch;
+            if (sketch != null && sketch.Profile != null && sketch.Profile.Size > 0)
+            {
+                CurveArray outerArray = sketch.Profile.get_Item(0);
+                if (outerArray != null && outerArray.Size >= 3)
+                {
+                    return ExtractPolyFromCurveArray(outerArray);
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            Options opts = new Options { DetailLevel = ViewDetailLevel.Fine };
+            GeometryElement geom = f.get_Geometry(opts);
+            if (geom != null)
+            {
+                foreach (GeometryObject obj in geom)
+                {
+                    Solid solid = obj as Solid;
+                    if (solid == null && obj is GeometryInstance gi)
+                    {
+                        solid = gi.GetInstanceGeometry()?.OfType<Solid>().FirstOrDefault(s => s != null && s.Volume > 0);
+                    }
+                    if (solid != null && solid.Volume > 0)
+                    {
+                        PlanarFace topFace = null;
+                        double maxZ = double.MinValue;
+                        foreach (Face face in solid.Faces)
+                        {
+                            if (face is PlanarFace pf && pf.FaceNormal.Z > 0.8)
+                            {
+                                if (pf.Origin.Z > maxZ)
+                                {
+                                    maxZ = pf.Origin.Z;
+                                    topFace = pf;
+                                }
+                            }
+                        }
+                        if (topFace != null)
+                        {
+                            EdgeArray outerLoop = topFace.EdgeLoops.Cast<EdgeArray>().OrderByDescending(el => el.Size).FirstOrDefault();
+                            if (outerLoop != null)
+                            {
+                                List<Pt2D> pts = new List<Pt2D>();
+                                foreach (Edge edge in outerLoop)
+                                {
+                                    Curve c = edge.AsCurve();
+                                    XYZ p = c.GetEndPoint(0);
+                                    pts.Add(new Pt2D(p.X, p.Y));
+                                }
+                                if (pts.Count >= 3) return pts;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    double shortCurveTol = doc.Application.ShortCurveTolerance;
+
+    CurveLoop CreateCurveLoopFromPts(List<Pt2D> pts, double planeZ, double shortTol)
+    {
+        if (pts == null || pts.Count < 3) return null;
+
+        List<XYZ> clean = new List<XYZ>();
+        for (int i = 0; i < pts.Count; i++)
+        {
+            XYZ p = new XYZ(pts[i].X, pts[i].Y, planeZ);
+            if (clean.Count == 0 || p.DistanceTo(clean[clean.Count - 1]) > shortTol)
+            {
+                clean.Add(p);
+            }
+        }
+        if (clean.Count >= 3 && clean[clean.Count - 1].DistanceTo(clean[0]) <= shortTol)
+        {
+            clean.RemoveAt(clean.Count - 1);
+        }
+        if (clean.Count < 3) return null;
+
+        double area = 0.0;
+        int n = clean.Count;
+        for (int i = 0; i < n; i++)
+        {
+            XYZ p1 = clean[i];
+            XYZ p2 = clean[(i + 1) % n];
+            area += (p1.X * p2.Y - p2.X * p1.Y);
+        }
+        if (Math.Abs(area) < 0.2) return null;
+
+        if (area < 0) clean.Reverse();
+
+        CurveLoop loop = new CurveLoop();
+        int count = clean.Count;
+        for (int i = 0; i < count; i++)
+        {
+            XYZ p1 = clean[i];
+            XYZ p2 = clean[(i + 1) % count];
+            if (p1.DistanceTo(p2) <= shortTol) return null;
+            loop.Append(Line.CreateBound(p1, p2));
+        }
+        return loop;
+    }
+
+    List<FloorResult> results = new List<FloorResult>();
+    int updated = 0;
+    int skipped = 0;
+
+    using (Transaction trans = new Transaction(doc, "[argus] Process Floor Slabs"))
+    {
+        trans.Start();
+
+        for (int fIdx = 0; fIdx < targetFloors.Count; fIdx++)
+        {
+            CheckCancellationRequested();
+            Floor f = targetFloors[fIdx];
+            if (f == null || !f.IsValidObject) continue;
+
+            ProgressUpdate($"Processing floor {fIdx + 1} of {targetFloors.Count}", fIdx + 1, targetFloors.Count);
+
+            BoundingBoxXYZ fBb = f.get_BoundingBox(null);
+            if (fBb == null)
+            {
+                skipped++;
+                results.Add(new FloorResult { Id = f.Id.ToString(), Name = f.Name, Level = doc.GetElement(f.LevelId) != null ? doc.GetElement(f.LevelId).Name : "-", Status = "Skipped (No BoundingBox)" });
+                continue;
+            }
+
+            List<Pt2D> outerPts = GetFloorTopBoundaryPts(f);
+            if (outerPts == null || outerPts.Count < 3)
+            {
+                skipped++;
+                results.Add(new FloorResult { Id = f.Id.ToString(), Name = f.Name, Level = doc.GetElement(f.LevelId) != null ? doc.GetElement(f.LevelId).Name : "-", Status = "Skipped (No Geometry)" });
+                continue;
+            }
+
+            string floorName = f.Name;
+            Element levelElem = doc.GetElement(f.LevelId);
+            string levelName = levelElem != null ? levelElem.Name : "-";
+            ElementId typeId = f.GetTypeId();
+            ElementId levelId = f.LevelId;
+
+            Parameter structParam = f.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL);
+            bool isStructural = structParam != null && structParam.Definition != null && structParam.AsInteger() == 1;
+
+            Parameter offsetParam = f.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);
+            double heightOffset = offsetParam != null && offsetParam.Definition != null ? offsetParam.AsDouble() : 0.0;
+            double planeZ = fBb.Max.Z;
+
+            if (action == "split")
+            {
+                List<Seg2D> rawSegs = new List<Seg2D>();
+
+                for (int i = 0; i < outerPts.Count; i++)
+                {
+                    Pt2D p1 = outerPts[i];
+                    Pt2D p2 = outerPts[(i + 1) % outerPts.Count];
+                    rawSegs.Add(new Seg2D(p1, p2));
+                }
+
+                List<Wall> allWalls = new FilteredElementCollector(doc)
+                    .OfCategory(BuiltInCategory.OST_Walls)
+                    .WhereElementIsNotElementType()
+                    .Cast<Wall>()
+                    .ToList();
+
+                List<Wall> contactWalls = new List<Wall>();
+
+                foreach (Wall w in allWalls)
+                {
+                    if (w == null || !w.IsValidObject) continue;
+
+                    bool isWallStructural = (int)w.StructuralUsage != 0;
+                    Parameter pStruct = w.get_Parameter(BuiltInParameter.WALL_STRUCTURAL_USAGE_PARAM);
+                    if (pStruct != null && pStruct.Definition != null && pStruct.AsInteger() > 0) isWallStructural = true;
+
+                    if (!isWallStructural) continue;
+
+                    BoundingBoxXYZ wBb = w.get_BoundingBox(null);
+                    if (wBb == null) continue;
+
+                    bool overlapXY = (wBb.Max.X >= fBb.Min.X - 1.0 && wBb.Min.X <= fBb.Max.X + 1.0 &&
+                                      wBb.Max.Y >= fBb.Min.Y - 1.0 && wBb.Min.Y <= fBb.Max.Y + 1.0);
+                    if (!overlapXY) continue;
+
+                    bool contactZ = (wBb.Max.Z >= fBb.Min.Z - 3.0 && wBb.Max.Z <= fBb.Max.Z + 1.5 &&
+                                     wBb.Min.Z < fBb.Min.Z);
+                    if (!contactZ) continue;
+
+                    LocationCurve wLoc = w.Location as LocationCurve;
+                    Line wLine = wLoc?.Curve as Line;
+                    if (wLine == null) continue;
+
+                    XYZ p0 = wLine.GetEndPoint(0);
+                    XYZ p1 = wLine.GetEndPoint(1);
+                    Pt2D ptA = new Pt2D(p0.X, p0.Y);
+                    Pt2D ptB = new Pt2D(p1.X, p1.Y);
+
+                    if (ptA.Dist(ptB) <= 0.1) continue;
+
+                    contactWalls.Add(w);
+
+                    if (splitRef == "contact")
+                    {
+                        double dx = p1.X - p0.X;
+                        double dy = p1.Y - p0.Y;
+                        double len = Math.Sqrt(dx * dx + dy * dy);
+                        if (len < 0.01) continue;
+
+                        double ux = dx / len;
+                        double uy = dy / len;
+                        double nx = -uy;
+                        double ny = ux;
+
+                        double wWidth = w.Width;
+                        double halfWidth = wWidth / 2.0;
+
+                        double distLeft = halfWidth;
+                        double distRight = -halfWidth;
+
+                        Parameter locLineParam = w.get_Parameter(BuiltInParameter.WALL_KEY_REF_PARAM);
+                        if (locLineParam != null && locLineParam.Definition != null)
+                        {
+                            int locVal = locLineParam.AsInteger();
+                            if (locVal == 2 || locVal == 4)
+                            {
+                                distLeft = 0;
+                                distRight = -wWidth;
+                            }
+                            else if (locVal == 3 || locVal == 5)
+                            {
+                                distLeft = wWidth;
+                                distRight = 0;
+                            }
+                        }
+
+                        double ext = Math.Max(wWidth * 1.5, 1.5);
+
+                        Pt2D p0Ext = new Pt2D(p0.X - ux * ext, p0.Y - uy * ext);
+                        Pt2D p1Ext = new Pt2D(p1.X + ux * ext, p1.Y + uy * ext);
+
+                        Pt2D left0 = new Pt2D(p0Ext.X + nx * distLeft, p0Ext.Y + ny * distLeft);
+                        Pt2D left1 = new Pt2D(p1Ext.X + nx * distLeft, p1Ext.Y + ny * distLeft);
+                        rawSegs.Add(new Seg2D(left0, left1));
+
+                        Pt2D right0 = new Pt2D(p0Ext.X + nx * distRight, p0Ext.Y + ny * distRight);
+                        Pt2D right1 = new Pt2D(p1Ext.X + nx * distRight, p1Ext.Y + ny * distRight);
+                        rawSegs.Add(new Seg2D(right0, right1));
+                    }
+                    else
+                    {
+                        rawSegs.Add(new Seg2D(ptA, ptB));
+                    }
+                }
+
+                List<Seg2D> atomicSegs = new List<Seg2D>();
+                foreach (Seg2D s in rawSegs)
+                {
+                    List<Pt2D> ptsOnSeg = new List<Pt2D> { s.P1, s.P2 };
+                    foreach (Seg2D other in rawSegs)
+                    {
+                        if (s == other) continue;
+                        Pt2D inter = GetSegmentIntersection(s.P1, s.P2, other.P1, other.P2);
+                        if (inter != null && s.P1.Dist(inter) > 0.01 && s.P2.Dist(inter) > 0.01)
+                        {
+                            ptsOnSeg.Add(inter);
+                        }
+                    }
+                    ptsOnSeg = ptsOnSeg.OrderBy(p => s.P1.Dist(p)).ToList();
+                    for (int k = 0; k < ptsOnSeg.Count - 1; k++)
+                    {
+                        if (ptsOnSeg[k].Dist(ptsOnSeg[k + 1]) > 0.01)
+                        {
+                            atomicSegs.Add(new Seg2D(ptsOnSeg[k], ptsOnSeg[k + 1]));
+                        }
+                    }
+                }
+
+                List<Pt2D> vertices = new List<Pt2D>();
+                int AddVertex(Pt2D pt)
+                {
+                    for (int i = 0; i < vertices.Count; i++)
+                    {
+                        if (vertices[i].Dist(pt) < 0.02) return i;
+                    }
+                    vertices.Add(pt);
+                    return vertices.Count - 1;
+                }
+
+                Dictionary<int, List<DirEdge>> outgoing = new Dictionary<int, List<DirEdge>>();
+                void AddGraphEdge(Pt2D p1, Pt2D p2)
+                {
+                    int u = AddVertex(p1);
+                    int v = AddVertex(p2);
+                    if (u == v) return;
+
+                    double a1 = Math.Atan2(p2.Y - p1.Y, p2.X - p1.X);
+                    if (!outgoing.ContainsKey(u)) outgoing[u] = new List<DirEdge>();
+                    if (!outgoing[u].Any(e => e.To == v)) outgoing[u].Add(new DirEdge(u, v, a1));
+
+                    double a2 = Math.Atan2(p1.Y - p2.Y, p1.X - p2.X);
+                    if (!outgoing.ContainsKey(v)) outgoing[v] = new List<DirEdge>();
+                    if (!outgoing[v].Any(e => e.To == u)) outgoing[v].Add(new DirEdge(v, u, a2));
+                }
+
+                foreach (Seg2D s in atomicSegs)
+                {
+                    AddGraphEdge(s.P1, s.P2);
+                }
+
+                bool pruned = true;
+                while (pruned)
+                {
+                    pruned = false;
+                    List<int> deg1 = outgoing.Where(kvp => kvp.Value.Count <= 1).Select(kvp => kvp.Key).ToList();
+                    foreach (int v in deg1)
+                    {
+                        pruned = true;
+                        if (outgoing.ContainsKey(v))
+                        {
+                            foreach (DirEdge e in outgoing[v])
+                            {
+                                if (outgoing.ContainsKey(e.To))
+                                {
+                                    outgoing[e.To].RemoveAll(re => re.To == v);
+                                }
+                            }
+                            outgoing.Remove(v);
+                        }
+                    }
+                }
+
+                foreach (var kvp in outgoing)
+                {
+                    kvp.Value.Sort((e1, e2) => e1.Angle.CompareTo(e2.Angle));
+                }
+
+                HashSet<string> globalVisited = new HashSet<string>();
+                List<List<Pt2D>> closedLoops = new List<List<Pt2D>>();
+
+                foreach (var kvp in outgoing)
+                {
+                    foreach (DirEdge startEdge in kvp.Value)
+                    {
+                        string key = $"{startEdge.From}->{startEdge.To}";
+                        if (globalVisited.Contains(key)) continue;
+
+                        HashSet<string> localVisited = new HashSet<string>();
+                        List<int> cycle = new List<int>();
+                        int curr = startEdge.From;
+                        int next = startEdge.To;
+                        bool validCycle = true;
+
+                        while (true)
+                        {
+                            string eKey = $"{curr}->{next}";
+                            if (localVisited.Contains(eKey)) break;
+                            localVisited.Add(eKey);
+                            cycle.Add(curr);
+
+                            if (!outgoing.ContainsKey(next) || outgoing[next].Count == 0) { validCycle = false; break; }
+
+                            var nextOut = outgoing[next];
+                            int revIdx = nextOut.FindIndex(e => e.To == curr);
+                            if (revIdx < 0) { validCycle = false; break; }
+
+                            int nextEdgeIdx = (revIdx - 1 + nextOut.Count) % nextOut.Count;
+                            DirEdge nextEdge = nextOut[nextEdgeIdx];
+
+                            curr = next;
+                            next = nextEdge.To;
+
+                            if (curr == startEdge.From && next == startEdge.To) break;
+                            if (cycle.Count > 500) { validCycle = false; break; }
+                        }
+
+                        if (validCycle && cycle.Count >= 3)
+                        {
+                            List<Pt2D> poly = cycle.Select(i => vertices[i]).ToList();
+
+                            double area = 0.0;
+                            int nP = poly.Count;
+                            for (int i = 0; i < nP; i++)
+                            {
+                                Pt2D p1 = poly[i];
+                                Pt2D p2 = poly[(i + 1) % nP];
+                                area += (p1.X * p2.Y - p2.X * p1.Y);
+                            }
+
+                            if (area > 0.5)
+                            {
+                                Pt2D centroid = new Pt2D(poly.Average(p => p.X), poly.Average(p => p.Y));
+                                if (IsPointInPolygon2D(centroid, outerPts))
+                                {
+                                    if (splitRef == "contact")
+                                    {
+                                        bool insideWallBody = false;
+                                        foreach (Wall w in contactWalls)
+                                        {
+                                            if (IsPointInsideWallBody(centroid, w))
+                                            {
+                                                insideWallBody = true;
+                                                break;
+                                            }
+                                        }
+                                        if (insideWallBody) continue;
+                                    }
+
+                                    foreach (string eK in localVisited) globalVisited.Add(eK);
+                                    closedLoops.Add(poly);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (closedLoops.Count == 0)
+                {
+                    skipped++;
+                    results.Add(new FloorResult { Id = f.Id.ToString(), Name = floorName, Level = levelName, Status = "Skipped (No Closed Loop)" });
+                    continue;
+                }
+
+                int createdCount = 0;
+                foreach (List<Pt2D> loopPts in closedLoops)
+                {
+                    CurveLoop cellLoop = CreateCurveLoopFromPts(loopPts, planeZ, shortCurveTol);
+                    if (cellLoop != null && cellLoop.Count() >= 3)
+                    {
+                        try
+                        {
+                            Floor newDalle = Floor.Create(doc, new List<CurveLoop> { cellLoop }, typeId, levelId);
+
+                            Parameter newStructParam = newDalle.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL);
+                            if (newStructParam != null && newStructParam.Definition != null) newStructParam.Set(isStructural ? 1 : 0);
+
+                            Parameter newOffsetParam = newDalle.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);
+                            if (newOffsetParam != null && newOffsetParam.Definition != null) newOffsetParam.Set(heightOffset);
+
+                            CopyInstanceParameters(f, newDalle);
+                            createdCount++;
+                            results.Add(new FloorResult { Id = newDalle.Id.ToString(), Name = floorName, Level = levelName, Status = "Découpée" });
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.AppendLine($"Failed to create closed loop floor: {ex.Message}");
+                        }
+                    }
+                }
+
+                if (createdCount > 0)
+                {
+                    doc.Delete(f.Id);
+                    updated++;
+                }
+                else
+                {
+                    skipped++;
+                    results.Add(new FloorResult { Id = f.Id.ToString(), Name = floorName, Level = levelName, Status = "Skipped (Creation Error)" });
+                }
+            }
+            else if (action == "align")
+            {
+                int nPts = outerPts.Count;
+                double centX = outerPts.Average(p => p.X);
+                double centY = outerPts.Average(p => p.Y);
+                Pt2D centroid = new Pt2D(centX, centY);
+
+                List<Wall> allWalls = new FilteredElementCollector(doc)
+                    .OfCategory(BuiltInCategory.OST_Walls)
+                    .WhereElementIsNotElementType()
+                    .Cast<Wall>()
+                    .ToList();
+
+                List<Wall> contactWalls = new List<Wall>();
+                foreach (Wall w in allWalls)
+                {
+                    if (w == null || !w.IsValidObject) continue;
+
+                    bool isWallStructural = (int)w.StructuralUsage != 0;
+                    Parameter pStruct = w.get_Parameter(BuiltInParameter.WALL_STRUCTURAL_USAGE_PARAM);
+                    if (pStruct != null && pStruct.Definition != null && pStruct.AsInteger() > 0) isWallStructural = true;
+
+                    if (!isWallStructural) continue;
+
+                    BoundingBoxXYZ wBb = w.get_BoundingBox(null);
+                    if (wBb == null) continue;
+
+                    bool overlapXY = (wBb.Max.X >= fBb.Min.X - 1.0 && wBb.Min.X <= fBb.Max.X + 1.0 &&
+                                      wBb.Max.Y >= fBb.Min.Y - 1.0 && wBb.Min.Y <= fBb.Max.Y + 1.0);
+                    if (!overlapXY) continue;
+
+                    bool contactZ = (wBb.Max.Z >= fBb.Min.Z - 3.0 && wBb.Max.Z <= fBb.Max.Z + 1.5 &&
+                                     wBb.Min.Z < fBb.Min.Z);
+                    if (!contactZ) continue;
+
+                    LocationCurve wLoc = w.Location as LocationCurve;
+                    Line wLine = wLoc?.Curve as Line;
+                    if (wLine == null) continue;
+
+                    contactWalls.Add(w);
+                }
+
+                List<Seg2D> origEdges = new List<Seg2D>();
+                List<Seg2D> targetLines = new List<Seg2D>();
+
+                for (int i = 0; i < nPts; i++)
+                {
+                    Pt2D pA = outerPts[i];
+                    Pt2D pB = outerPts[(i + 1) % nPts];
+                    Seg2D origEdge = new Seg2D(pA, pB);
+                    origEdges.Add(origEdge);
+
+                    double edgeDx = pB.X - pA.X;
+                    double edgeDy = pB.Y - pA.Y;
+                    double edgeLen = Math.Sqrt(edgeDx * edgeDx + edgeDy * edgeDy);
+                    if (edgeLen < 0.01)
+                    {
+                        targetLines.Add(origEdge);
+                        continue;
+                    }
+
+                    double edgeUx = edgeDx / edgeLen;
+                    double edgeUy = edgeDy / edgeLen;
+
+                    Wall bestWall = null;
+                    double bestDist = double.MaxValue;
+                    Seg2D bestWallRefSeg = null;
+
+                    Pt2D edgeMid = new Pt2D((pA.X + pB.X) / 2.0, (pA.Y + pB.Y) / 2.0);
+
+                    foreach (Wall w in contactWalls)
+                    {
+                        LocationCurve wLoc = w.Location as LocationCurve;
+                        Line wLine = wLoc?.Curve as Line;
+                        if (wLine == null) continue;
+
+                        XYZ wp0 = wLine.GetEndPoint(0);
+                        XYZ wp1 = wLine.GetEndPoint(1);
+
+                        double wDx = wp1.X - wp0.X;
+                        double wDy = wp1.Y - wp0.Y;
+                        double wLen = Math.Sqrt(wDx * wDx + wDy * wDy);
+                        if (wLen < 0.01) continue;
+
+                        double wUx = wDx / wLen;
+                        double wUy = wDy / wLen;
+
+                        double dot = Math.Abs(edgeUx * wUx + edgeUy * wUy);
+                        if (dot < 0.95) continue;
+
+                        double wNx = -wUy;
+                        double wNy = wUx;
+                        double distToWallLine = Math.Abs((edgeMid.X - wp0.X) * wNx + (edgeMid.Y - wp0.Y) * wNy);
+
+                        double maxTol = w.Width + 2.0;
+                        if (distToWallLine < maxTol && distToWallLine < bestDist)
+                        {
+                            double halfWidth = w.Width / 2.0;
+
+                            double locOffset = 0.0;
+                            Parameter locLineParam = w.get_Parameter(BuiltInParameter.WALL_KEY_REF_PARAM);
+                            if (locLineParam != null && locLineParam.Definition != null)
+                            {
+                                int locVal = locLineParam.AsInteger();
+                                if (locVal == 2 || locVal == 4) locOffset = -halfWidth;
+                                else if (locVal == 3 || locVal == 5) locOffset = halfWidth;
+                            }
+
+                            Pt2D c0 = new Pt2D(wp0.X + wNx * locOffset, wp0.Y + wNy * locOffset);
+                            Pt2D c1 = new Pt2D(wp1.X + wNx * locOffset, wp1.Y + wNy * locOffset);
+
+                            if (alignTo == "axis")
+                            {
+                                bestWallRefSeg = new Seg2D(c0, c1);
+                            }
+                            else
+                            {
+                                Pt2D wallMid = new Pt2D((c0.X + c1.X) / 2.0, (c0.Y + c1.Y) / 2.0);
+                                double toCentX = centroid.X - wallMid.X;
+                                double toCentY = centroid.Y - wallMid.Y;
+
+                                double inNx = wNx;
+                                double inNy = wNy;
+                                if (toCentX * inNx + toCentY * inNy < 0)
+                                {
+                                    inNx = -inNx;
+                                    inNy = -inNy;
+                                }
+
+                                double shift = 0.0;
+                                if (alignTo == "interior")
+                                {
+                                    shift = halfWidth;
+                                }
+                                else if (alignTo == "exterior")
+                                {
+                                    shift = -halfWidth;
+                                }
+
+                                Pt2D t0 = new Pt2D(c0.X + inNx * shift, c0.Y + inNy * shift);
+                                Pt2D t1 = new Pt2D(c1.X + inNx * shift, c1.Y + inNy * shift);
+                                bestWallRefSeg = new Seg2D(t0, t1);
+                            }
+
+                            bestDist = distToWallLine;
+                            bestWall = w;
+                        }
+                    }
+
+                    if (bestWallRefSeg != null)
+                    {
+                        targetLines.Add(bestWallRefSeg);
+                    }
+                    else
+                    {
+                        targetLines.Add(origEdge);
+                    }
+                }
+
+                List<Pt2D> alignedPts = new List<Pt2D>();
+                for (int i = 0; i < nPts; i++)
+                {
+                    Seg2D lineCurr = targetLines[i];
+                    Seg2D linePrev = targetLines[(i - 1 + nPts) % nPts];
+
+                    Pt2D inter = GetLineIntersectionInfinite(linePrev.P1, linePrev.P2, lineCurr.P1, lineCurr.P2);
+                    if (inter != null)
+                    {
+                        alignedPts.Add(inter);
+                    }
+                    else
+                    {
+                        alignedPts.Add(outerPts[i]);
+                    }
+                }
+
+                CurveLoop alignedLoop = CreateCurveLoopFromPts(alignedPts, planeZ, shortCurveTol);
+                if (alignedLoop != null && alignedLoop.Count() >= 3)
+                {
+                    try
+                    {
+                        Floor newAlignedFloor = Floor.Create(doc, new List<CurveLoop> { alignedLoop }, typeId, levelId);
+
+                        Parameter newStructParam = newAlignedFloor.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL);
+                        if (newStructParam != null && newStructParam.Definition != null) newStructParam.Set(isStructural ? 1 : 0);
+
+                        Parameter newOffsetParam = newAlignedFloor.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);
+                        if (newOffsetParam != null && newOffsetParam.Definition != null) newOffsetParam.Set(heightOffset);
+
+                        CopyInstanceParameters(f, newAlignedFloor);
+                        doc.Delete(f.Id);
+                        updated++;
+                        results.Add(new FloorResult { Id = newAlignedFloor.Id.ToString(), Name = floorName, Level = levelName, Status = "Alignée" });
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.AppendLine($"Failed to create aligned floor: {ex.Message}");
+                        skipped++;
+                        results.Add(new FloorResult { Id = f.Id.ToString(), Name = floorName, Level = levelName, Status = "Skipped (Creation Error)" });
+                    }
+                }
+                else
+                {
+                    skipped++;
+                    results.Add(new FloorResult { Id = f.Id.ToString(), Name = floorName, Level = levelName, Status = "Skipped (Invalid Geometry)" });
+                }
+            }
+            else
+            {
+                skipped++;
+                results.Add(new FloorResult { Id = f.Id.ToString(), Name = floorName, Level = levelName, Status = "Skipped" });
+            }
+        }
+
+        trans.Commit();
+    }
+
+    Logger.AppendLine($"Processing complete: {updated} updated/split, {skipped} skipped.");
+    return new Output { UpdatedCount = updated, SkippedCount = skipped, Floors = results.ToArray() };
+}

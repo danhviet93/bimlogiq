@@ -1,0 +1,68 @@
+class Inputs { }
+
+class Output
+{
+    public int IntCount { get; set; }
+    public int ExtCount { get; set; }
+    public int AscIntCount { get; set; }
+    public int AscExtCount { get; set; }
+}
+
+/// <summary>
+/// Calcule et renvoie les statistiques sur le nombre de voiles INT, EXT et les voiles des cages ASC/ESC.
+/// </summary>
+/// <param name="input">Aucun paramètre requis.</param>
+/// <returns>Les statistiques de décompte des voiles.</returns>
+Output Run(Inputs input)
+{
+    Document doc = UIDoc.Document;
+    var allWalls = new FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_Walls)
+        .WhereElementIsNotElementType()
+        .Cast<Wall>()
+        .ToList();
+
+    int intCount = 0;
+    int extCount = 0;
+    int ascInt = 0;
+    int ascExt = 0;
+
+    foreach (var w in allWalls)
+    {
+        string name = w.WallType.Name;
+        if (name.Contains("_INT")) intCount++;
+        if (name.Contains("_EXT")) extCount++;
+
+        var bb = w.get_BoundingBox(null);
+        if (bb == null) continue;
+        double cx = (bb.Min.X + bb.Max.X) / 2;
+        double cy = (bb.Min.Y + bb.Max.Y) / 2;
+
+        if (cx >= 422 && cx <= 445 && cy >= -60 && cy <= -30)
+        {
+            bool isASC_North = Math.Abs(cy - (-40.32)) < 0.8 && cx >= 432.0 && cx <= 443.5;
+            bool isASC_South = Math.Abs(cy - (-50.33)) < 0.8 && cx >= 432.0 && cx <= 443.5;
+            bool isASC_East  = Math.Abs(cx - 442.84) < 0.8 && cy >= -51.5 && cy <= -35.0;
+
+            bool isESC_North = Math.Abs(cy - (-40.81)) < 0.8 && cx >= 425.5 && cx <= 433.5;
+            bool isESC_South = Math.Abs(cy - (-51.84)) < 0.8 && cx >= 425.5 && cx <= 433.5;
+            bool isESC_West  = Math.Abs(cx - 426.83) < 0.8 && cy >= -52.5 && cy <= -39.5;
+
+            bool isCommon_WestASC_EastESC = Math.Abs(cx - 432.90) < 0.8 && cy >= -52.5 && cy <= -39.5;
+
+            if (isASC_North || isASC_South || isASC_East || isESC_North || isESC_South || isESC_West || isCommon_WestASC_EastESC)
+            {
+                if (name.Contains("_INT")) ascInt++;
+                if (name.Contains("_EXT")) ascExt++;
+            }
+        }
+    }
+
+    return new Output
+    {
+        IntCount = intCount,
+        ExtCount = extCount,
+        AscIntCount = ascInt,
+        AscExtCount = ascExt
+    };
+}

@@ -1,0 +1,611 @@
+class Inputs
+{
+    public string LinkFilePath { get; set; }
+    public string CentralModelPath { get; set; }
+}
+
+class Output
+{
+    public bool Success { get; set; }
+    public string LogMessage { get; set; }
+    public int CreatedWorksetsCount { get; set; }
+    public int CopiedProjectInfoCount { get; set; }
+    public int CopiedGridsCount { get; set; }
+    public int CreatedLevelsCount { get; set; }
+    public int CreatedViewsCount { get; set; }
+    public string SavedCentralPath { get; set; }
+}
+
+static class Native
+{
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(System.IntPtr h);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern System.IntPtr SetActiveWindow(System.IntPtr h);
+    public static void FocusRevit(System.IntPtr h) { SetForegroundWindow(h); SetActiveWindow(h); }
+}
+
+public class DuplicateTypeNamesHandler : IDuplicateTypeNamesHandler
+{
+    public DuplicateTypeAction OnDuplicateTypeNamesFound(DuplicateTypeNamesHandlerArgs args)
+    {
+        return DuplicateTypeAction.UseDestinationTypes;
+    }
+}
+
+/// <summary>Automates EIFFAGE STR project initialization: creates worksets, links arch model, cleans host, copies levels &amp; grids décalés à la couche portante de la dalle Architecte, and creates structural plan views (Plan de structure) for levels starting with 'PH'.</summary>
+/// <param name="input">Path to the architectural model file to link.</param>
+/// <returns>Summary of created worksets, copied grids, generated structural levels, and plan views.</returns>
+Output Run(Inputs input)
+{
+    Document doc = UIDoc.Document;
+    int worksetsCount = 0;
+    int gridsCount = 0;
+    int levelsCount = 0;
+    int viewsCount = 0;
+
+    ViewFamilyType view3DFamilyType = new FilteredElementCollector(doc)
+        .OfClass(typeof(ViewFamilyType))
+        .Cast<ViewFamilyType>()
+        .FirstOrDefault(x => x.ViewFamily == ViewFamily.ThreeDimensional);
+
+    if (view3DFamilyType != null)
+    {
+        View3D viewer3D = null;
+        using (Transaction t3d = new Transaction(doc, "[argus] Create 3D Viewer View"))
+        {
+            t3d.Start();
+            viewer3D = View3D.CreateIsometric(doc, view3DFamilyType.Id);
+            
+            string base3DName = "3D - Viewer (No Archi Link)";
+            string unique3DName = base3DName;
+            int nameCount = 1;
+            List<string> existingNames = new FilteredElementCollector(doc)
+                .OfClass(typeof(View))
+                .Cast<View>()
+                .Select(v => v.Name)
+                .ToList();
+
+            while (existingNames.Contains(unique3DName, StringComparer.OrdinalIgnoreCase))
+            {
+                unique3DName = $"{base3DName} ({nameCount})";
+                nameCount++;
+            }
+            viewer3D.Name = unique3DName;
+
+            Category rvtLinksCat = doc.Settings.Categories.get_Item(BuiltInCategory.OST_RvtLinks);
+            if (rvtLinksCat != null && viewer3D.CanCategoryBeHidden(rvtLinksCat.Id))
+            {
+                viewer3D.SetCategoryHidden(rvtLinksCat.Id, true);
+            }
+
+            List<RevitLinkInstance> currentLinks = new FilteredElementCollector(doc)
+                .OfClass(typeof(RevitLinkInstance))
+                .Cast<RevitLinkInstance>()
+                .ToList();
+
+            foreach (var linkInst in currentLinks)
+            {
+                CheckCancellationRequested();
+                if (linkInst.CanBeHidden(viewer3D))
+                {
+                    viewer3D.HideElements(new List<ElementId> { linkInst.Id });
+                }
+            }
+
+            t3d.Commit();
+        }
+
+        if (viewer3D != null)
+        {
+            try
+            {
+                UIDoc.ActiveView = viewer3D;
+                Logger.AppendLine($"Created and activated 3D view: {viewer3D.Name}");
+            }
+            catch (Exception ex)
+            {
+                Logger.AppendLine($"3D view created, but could not set as active view: {ex.Message}");
+            }
+        }
+    }
+
+    if (!doc.IsWorkshared)
+    {
+        doc.EnableWorksharing("01_EIF_NIVEAUX ET QUADRILLAGES", "02_EIF_STR");
+        Logger.AppendLine("Enabled worksharing.");
+    }
+
+    string finalCentralPath = input.CentralModelPath;
+    if (string.IsNullOrEmpty(finalCentralPath))
+    {
+        var saveDlg = new Microsoft.Win32.SaveFileDialog();
+        saveDlg.Filter = "Revit Project (*.rvt)|*.rvt";
+        saveDlg.Title = "Select Location and Name for Central Model";
+        saveDlg.FileName = doc.Title + "_Central.rvt";
+        Native.FocusRevit(UIApp.MainWindowHandle);
+        if (saveDlg.ShowDialog() == true)
+        {
+            finalCentralPath = saveDlg.FileName;
+        }
+    }
+
+    if (!string.IsNullOrEmpty(finalCentralPath))
+    {
+        try
+        {
+            SaveAsOptions saveOptions = new SaveAsOptions();
+            saveOptions.OverwriteExistingFile = true;
+            WorksharingSaveAsOptions wsOptions = new WorksharingSaveAsOptions();
+            wsOptions.SaveAsCentral = true;
+            saveOptions.SetWorksharingOptions(wsOptions);
+
+            ModelPath mPath = ModelPathUtils.ConvertUserVisiblePathToModelPath(finalCentralPath);
+            doc.SaveAs(mPath, saveOptions);
+            Logger.AppendLine($"Saved as Central Model to: {finalCentralPath}");
+        }
+        catch (Exception ex)
+        {
+            Logger.AppendLine($"Could not save central model: {ex.Message}");
+        }
+    }
+
+    string[] requiredWorksets = new string[]
+    {
+        "01_EIF_NIVEAUX ET QUADRILLAGES",
+        "02_EIF_STR",
+        "03_EIF_LIENS",
+        "04_HORS LOT"
+    };
+
+    WorksetTable worksetTable = doc.GetWorksetTable();
+
+    using (Transaction t = new Transaction(doc, "[argus] Create EIFFAGE Worksets"))
+    {
+        t.Start();
+        FilteredWorksetCollector existing = new FilteredWorksetCollector(doc).OfKind(WorksetKind.UserWorkset);
+        foreach (string name in requiredWorksets)
+        {
+            CheckCancellationRequested();
+            if (!existing.Any(w => string.Compare(w.Name, name, StringComparison.OrdinalIgnoreCase) == 0))
+            {
+                if (WorksetTable.IsWorksetNameUnique(doc, name))
+                {
+                    Workset.Create(doc, name);
+                    worksetsCount++;
+                    Logger.AppendLine($"Created workset: {name}");
+                }
+            }
+        }
+
+        Workset targetActive = new FilteredWorksetCollector(doc)
+            .OfKind(WorksetKind.UserWorkset)
+            .FirstOrDefault(w => string.Compare(w.Name, "02_EIF_STR", StringComparison.OrdinalIgnoreCase) == 0);
+
+        if (targetActive != null)
+        {
+            worksetTable.SetActiveWorksetId(targetActive.Id);
+            Logger.AppendLine("Set active workset: 02_EIF_STR");
+        }
+
+        t.Commit();
+    }
+
+    RevitLinkInstance linkInstance = null;
+    Document linkDoc = null;
+    Transform transform = Transform.Identity;
+
+    if (!string.IsNullOrEmpty(input.LinkFilePath) && System.IO.File.Exists(input.LinkFilePath))
+    {
+        using (Transaction t = new Transaction(doc, "[argus] Link Architectural Model"))
+        {
+            t.Start();
+            FilePath filePath = new FilePath(input.LinkFilePath);
+            RevitLinkOptions options = new RevitLinkOptions(false);
+
+            RevitLinkType existingType = new FilteredElementCollector(doc)
+                .OfClass(typeof(RevitLinkType))
+                .Cast<RevitLinkType>()
+                .FirstOrDefault(lt => string.Compare(System.IO.Path.GetFileName(input.LinkFilePath), lt.Name, StringComparison.OrdinalIgnoreCase) == 0);
+
+            if (existingType == null)
+            {
+                LinkLoadResult result = RevitLinkType.Create(doc, filePath, options);
+                if (result.LoadResult == LinkLoadResultType.LinkLoaded)
+                {
+                    linkInstance = RevitLinkInstance.Create(doc, result.ElementId, ImportPlacement.Origin);
+                    Logger.AppendLine("Linked architectural model.");
+                }
+            }
+            else
+            {
+                linkInstance = new FilteredElementCollector(doc)
+                    .OfClass(typeof(RevitLinkInstance))
+                    .Cast<RevitLinkInstance>()
+                    .FirstOrDefault(li => li.GetTypeId() == existingType.Id);
+            }
+
+            if (linkInstance != null)
+            {
+                try
+                {
+                    doc.AcquireCoordinates(linkInstance.Id);
+                    Logger.AppendLine("Acquired shared coordinates.");
+                }
+                catch { }
+            }
+
+            t.Commit();
+        }
+    }
+
+    if (linkInstance == null)
+    {
+        linkInstance = new FilteredElementCollector(doc)
+            .OfClass(typeof(RevitLinkInstance))
+            .Cast<RevitLinkInstance>()
+            .FirstOrDefault();
+    }
+
+    int projInfoCount = 0;
+    if (linkInstance != null)
+    {
+        linkDoc = linkInstance.GetLinkDocument();
+        transform = linkInstance.GetTotalTransform();
+
+        if (linkDoc != null)
+        {
+            ProjectInfo linkInfo = linkDoc.ProjectInformation;
+            ProjectInfo hostInfo = doc.ProjectInformation;
+            if (linkInfo != null && hostInfo != null)
+            {
+                using (Transaction tProj = new Transaction(doc, "[argus] Copy Project Information from Arch Link"))
+                {
+                    tProj.Start();
+                    foreach (Parameter srcParam in linkInfo.Parameters)
+                    {
+                        CheckCancellationRequested();
+                        if (srcParam.StorageType == StorageType.None || !srcParam.HasValue) continue;
+
+                        string paramName = srcParam.Definition.Name;
+                        if (paramName == "Catégorie" || paramName == "Sous-projet" || paramName == "Nom de la famille" || paramName == "Nom du type" || paramName == "Variantes" || paramName == "Paramètres d'analyse de l'itinéraire")
+                            continue;
+
+                        Parameter hostParam = null;
+                        if (srcParam.IsShared)
+                        {
+                            try { hostParam = hostInfo.get_Parameter(srcParam.GUID); } catch {}
+                        }
+                        if (hostParam == null && srcParam.Definition is InternalDefinition intDef)
+                        {
+                            BuiltInParameter bip = intDef.BuiltInParameter;
+                            if (bip != BuiltInParameter.INVALID)
+                            {
+                                hostParam = hostInfo.get_Parameter(bip);
+                            }
+                        }
+                        if (hostParam == null)
+                        {
+                            hostParam = hostInfo.LookupParameter(paramName);
+                        }
+
+                        if (hostParam != null && !hostParam.IsReadOnly)
+                        {
+                            if (srcParam.StorageType == StorageType.String)
+                            {
+                                string newStr = srcParam.AsString();
+                                if (!string.IsNullOrEmpty(newStr))
+                                {
+                                    hostParam.Set(newStr);
+                                    projInfoCount++;
+                                }
+                            }
+                            else if (srcParam.StorageType == StorageType.Double)
+                            {
+                                hostParam.Set(srcParam.AsDouble());
+                                projInfoCount++;
+                            }
+                            else if (srcParam.StorageType == StorageType.Integer)
+                            {
+                                hostParam.Set(srcParam.AsInteger());
+                                projInfoCount++;
+                            }
+                        }
+                    }
+                    tProj.Commit();
+                    Logger.AppendLine($"Copied {projInfoCount} Project Information parameters from linked architectural model.");
+                }
+            }
+        }
+    }
+
+    using (Transaction t = new Transaction(doc, "[argus] Clean Base Model"))
+    {
+        t.Start();
+
+        List<ElementId> gridIds = new FilteredElementCollector(doc)
+            .OfClass(typeof(Grid))
+            .WhereElementIsNotElementType()
+            .ToElementIds()
+            .ToList();
+
+        foreach (ElementId id in gridIds)
+        {
+            CheckCancellationRequested();
+            try { doc.Delete(id); } catch { }
+        }
+
+        BuiltInCategory[] cats = new BuiltInCategory[]
+        {
+            BuiltInCategory.OST_Walls, BuiltInCategory.OST_Floors, BuiltInCategory.OST_StructuralColumns,
+            BuiltInCategory.OST_Columns, BuiltInCategory.OST_StructuralFraming, BuiltInCategory.OST_Windows,
+            BuiltInCategory.OST_Doors, BuiltInCategory.OST_GenericModel, BuiltInCategory.OST_Roofs
+        };
+
+        foreach (BuiltInCategory cat in cats)
+        {
+            CheckCancellationRequested();
+            List<ElementId> ids = new FilteredElementCollector(doc).OfCategory(cat).WhereElementIsNotElementType().ToElementIds().ToList();
+            foreach (ElementId id in ids)
+            {
+                CheckCancellationRequested();
+                try { doc.Delete(id); } catch { }
+            }
+        }
+
+        t.Commit();
+    }
+
+    if (linkDoc != null)
+    {
+        List<Level> newLevelsList = new List<Level>();
+
+        using (Transaction t = new Transaction(doc, "[argus] Copy Grids and Levels"))
+        {
+            t.Start();
+
+            List<ElementId> linkGridIds = new FilteredElementCollector(linkDoc)
+                .OfClass(typeof(Grid))
+                .WhereElementIsNotElementType()
+                .ToElementIds()
+                .ToList();
+
+            if (linkGridIds.Count > 0)
+            {
+                CopyPasteOptions cpOptions = new CopyPasteOptions();
+                cpOptions.SetDuplicateTypeNamesHandler(new DuplicateTypeNamesHandler());
+                ICollection<ElementId> copiedGrids = ElementTransformUtils.CopyElements(linkDoc, linkGridIds, doc, transform, cpOptions);
+                gridsCount = copiedGrids.Count;
+                Logger.AppendLine($"Copied {gridsCount} grids.");
+            }
+
+            List<Level> initialHostLevels = new FilteredElementCollector(doc).OfClass(typeof(Level)).Cast<Level>().ToList();
+            List<Level> archLevels = new FilteredElementCollector(linkDoc).OfClass(typeof(Level)).Cast<Level>().OrderBy(l => l.Elevation).ToList();
+
+            List<Floor> linkFloors = new FilteredElementCollector(linkDoc).OfClass(typeof(Floor)).Cast<Floor>().ToList();
+
+            foreach (Level archLvl in archLevels)
+            {
+                CheckCancellationRequested();
+                string strName = "PH-" + archLvl.Name;
+
+                var floorsAtLvl = linkFloors.Where(f => f.LevelId == archLvl.Id).ToList();
+                Floor bestStructuralFloor = null;
+                double bestCoreTopElev = archLvl.Elevation + transform.Origin.Z;
+                double maxArea = -1;
+
+                foreach (var fl in floorsAtLvl)
+                {
+                    FloorType ft = fl.FloorType;
+                    if (ft == null) continue;
+
+                    string name = ft.Name ?? "";
+                    double heightOffset = 0;
+                    Parameter pOffset = fl.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);
+                    if (pOffset != null && pOffset.HasValue) heightOffset = pOffset.AsDouble();
+
+                    CompoundStructure cs = ft.GetCompoundStructure();
+                    double finishAboveCore = 0;
+                    if (cs != null)
+                    {
+                        int coreIndex = cs.GetFirstCoreLayerIndex();
+                        for (int i = 0; i < coreIndex; i++) finishAboveCore += cs.GetLayers()[i].Width;
+                    }
+
+                    double coreTopElev = archLvl.Elevation + heightOffset + transform.Origin.Z - finishAboveCore;
+
+                    double area = 0;
+                    Parameter pArea = fl.get_Parameter(BuiltInParameter.HOST_AREA_COMPUTED);
+                    if (pArea != null && pArea.HasValue) area = pArea.AsDouble();
+
+                    bool isStructuralParam = false;
+                    Parameter pStruct = fl.get_Parameter(BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL);
+                    if (pStruct != null && pStruct.HasValue) isStructuralParam = pStruct.AsInteger() == 1;
+
+                    bool isStructuralSlab = isStructuralParam ||
+                                            name.IndexOf("Beton", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                            name.IndexOf("Dalle", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                            name.IndexOf("CSP", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                            name.IndexOf("DC", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                            name.IndexOf("RHG", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                    if (isStructuralSlab && area > maxArea)
+                    {
+                        maxArea = area;
+                        bestStructuralFloor = fl;
+                        bestCoreTopElev = coreTopElev;
+                    }
+                }
+
+                if (bestStructuralFloor == null && floorsAtLvl.Count > 0)
+                {
+                    foreach (var fl in floorsAtLvl)
+                    {
+                        FloorType ft = fl.FloorType;
+                        if (ft == null) continue;
+                        double heightOffset = 0;
+                        Parameter pOffset = fl.get_Parameter(BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM);
+                        if (pOffset != null && pOffset.HasValue) heightOffset = pOffset.AsDouble();
+
+                        CompoundStructure cs = ft.GetCompoundStructure();
+                        double finishAboveCore = 0;
+                        if (cs != null)
+                        {
+                            int coreIndex = cs.GetFirstCoreLayerIndex();
+                            for (int i = 0; i < coreIndex; i++) finishAboveCore += cs.GetLayers()[i].Width;
+                        }
+
+                        double coreTopElev = archLvl.Elevation + heightOffset + transform.Origin.Z - finishAboveCore;
+                        double area = 0;
+                        Parameter pArea = fl.get_Parameter(BuiltInParameter.HOST_AREA_COMPUTED);
+                        if (pArea != null && pArea.HasValue) area = pArea.AsDouble();
+
+                        if (area > maxArea)
+                        {
+                            maxArea = area;
+                            bestStructuralFloor = fl;
+                            bestCoreTopElev = coreTopElev;
+                        }
+                    }
+                }
+
+                Level newLvl = Level.Create(doc, bestCoreTopElev);
+                try { newLvl.Name = strName; } catch { newLvl.Name = strName + "_STR"; }
+                newLevelsList.Add(newLvl);
+                levelsCount++;
+
+                double deltaMm = UnitUtils.ConvertFromInternalUnits(bestCoreTopElev - (archLvl.Elevation + transform.Origin.Z), UnitTypeId.Millimeters);
+                if (Math.Abs(deltaMm) > 0.1)
+                {
+                    Logger.AppendLine($"Niveau {strName} aligné à la couche portante: {UnitUtils.ConvertFromInternalUnits(bestCoreTopElev, UnitTypeId.Millimeters):F1} mm (Décalage: {deltaMm:F1} mm par rapport au Niveau Archi '{archLvl.Name}') [Dalle: '{bestStructuralFloor?.FloorType?.Name}']");
+                }
+                else
+                {
+                    Logger.AppendLine($"Niveau {strName} créé à l'altitude {UnitUtils.ConvertFromInternalUnits(bestCoreTopElev, UnitTypeId.Millimeters):F1} mm.");
+                }
+            }
+
+            foreach (Level hostLvl in initialHostLevels)
+            {
+                CheckCancellationRequested();
+                try { doc.Delete(hostLvl.Id); } catch { }
+            }
+
+            t.Commit();
+        }
+
+        ViewFamilyType strPlanType = new FilteredElementCollector(doc)
+            .OfClass(typeof(ViewFamilyType))
+            .Cast<ViewFamilyType>()
+            .FirstOrDefault(vft => vft.ViewFamily == ViewFamily.StructuralPlan);
+
+        ViewFamilyType floorPlanType = new FilteredElementCollector(doc)
+            .OfClass(typeof(ViewFamilyType))
+            .Cast<ViewFamilyType>()
+            .FirstOrDefault(vft => vft.ViewFamily == ViewFamily.FloorPlan);
+
+        List<Level> phLevels = newLevelsList
+            .Where(lvl => lvl != null && lvl.Name != null && lvl.Name.StartsWith("PH", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (phLevels.Count > 0)
+        {
+            using (Transaction t = new Transaction(doc, "[argus] Create Structural and Floor Plan Views"))
+            {
+                t.Start();
+
+                foreach (Level lvl in phLevels)
+                {
+                    CheckCancellationRequested();
+
+                    Parameter structParam = lvl.LookupParameter("Structural")
+                                   ?? lvl.get_Parameter(BuiltInParameter.LEVEL_IS_STRUCTURAL);
+                    if (structParam != null && !structParam.IsReadOnly)
+                    {
+                        try { structParam.Set(1); } catch { }
+                    }
+
+                    if (strPlanType != null)
+                    {
+                        try
+                        {
+                            ViewPlan strPlan = ViewPlan.Create(doc, strPlanType.Id, lvl.Id);
+                            strPlan.Name = "Plan de Structure - " + lvl.Name;
+                            viewsCount++;
+                        }
+                        catch { }
+                    }
+
+                    if (floorPlanType != null)
+                    {
+                        try
+                        {
+                            ViewPlan floorPlan = ViewPlan.Create(doc, floorPlanType.Id, lvl.Id);
+                            try { floorPlan.Name = lvl.Name; } catch { floorPlan.Name = "Plan d'étage - " + lvl.Name; }
+                            viewsCount++;
+                        }
+                        catch { }
+                    }
+                }
+
+                t.Commit();
+            }
+            Logger.AppendLine($"Checked 'Structural' parameter and created {viewsCount} plan views for levels starting with 'PH'.");
+        }
+    }
+
+    Workset levelsAndGridsWorkset = new FilteredWorksetCollector(doc)
+        .OfKind(WorksetKind.UserWorkset)
+        .FirstOrDefault(w => string.Compare(w.Name, "01_EIF_NIVEAUX ET QUADRILLAGES", StringComparison.OrdinalIgnoreCase) == 0);
+
+    if (levelsAndGridsWorkset != null)
+    {
+        using (Transaction tWs = new Transaction(doc, "[argus] Assign Levels and Grids to Workset"))
+        {
+            tWs.Start();
+
+            List<Element> hostLevels = new FilteredElementCollector(doc)
+                .OfCategory(BuiltInCategory.OST_Levels)
+                .WhereElementIsNotElementType()
+                .ToList();
+
+            List<Element> hostGrids = new FilteredElementCollector(doc)
+                .OfCategory(BuiltInCategory.OST_Grids)
+                .WhereElementIsNotElementType()
+                .ToList();
+
+            foreach (Element lvl in hostLevels)
+            {
+                CheckCancellationRequested();
+                Parameter p = lvl.get_Parameter(BuiltInParameter.ELEM_PARTITION_PARAM);
+                if (p != null && !p.IsReadOnly)
+                {
+                    p.Set(levelsAndGridsWorkset.Id.IntegerValue);
+                }
+            }
+
+            foreach (Element grd in hostGrids)
+            {
+                CheckCancellationRequested();
+                Parameter p = grd.get_Parameter(BuiltInParameter.ELEM_PARTITION_PARAM);
+                if (p != null && !p.IsReadOnly)
+                {
+                    p.Set(levelsAndGridsWorkset.Id.IntegerValue);
+                }
+            }
+
+            tWs.Commit();
+            Logger.AppendLine($"Assigned {hostLevels.Count} levels and {hostGrids.Count} grids to workset '01_EIF_NIVEAUX ET QUADRILLAGES'.");
+        }
+    }
+
+    return new Output
+    {
+        Success = true,
+        LogMessage = "Initialization completed successfully.",
+        CreatedWorksetsCount = worksetsCount,
+        CopiedProjectInfoCount = projInfoCount,
+        CopiedGridsCount = gridsCount,
+        CreatedLevelsCount = levelsCount,
+        CreatedViewsCount = viewsCount,
+        SavedCentralPath = finalCentralPath
+    };
+}

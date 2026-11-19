@@ -1,0 +1,592 @@
+"use client";
+
+import * as React from "react";
+import {
+  PlayIcon,
+  LayersIcon,
+  RefreshCwIcon,
+  CheckCircle2Icon,
+  SettingsIcon,
+  ChevronRightIcon,
+  ChevronLeftIcon,
+  ArrowRightIcon,
+  EyeIcon,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { DataTable } from "@/components/ui/data-table";
+import { execute, useRevitTask, RevitTaskBar } from "@/lib/revit-execute";
+
+export default function CombinedSTRWorkflow() {
+  const [activeTab, setActiveTab] = React.useState("step1");
+
+  // State Step 1
+  const [filePath, setFilePath] = React.useState(
+    "C:\\Users\\dvpham\\Desktop\\AI Bimlogiq\\69NLYO3-8028-PRO-ARC-SOHO-MQT-00C-_-001.rvt"
+  );
+  const [centralPath, setCentralPath] = React.useState("");
+
+  // State Step 2 (Normaliseur & Reconstructeur)
+  const [step2Result, setStep2Result] = React.useState<any>(null);
+
+  // State Step 3.1 (Aligneur Dalles)
+  const [s31Scope, setS31Scope] = React.useState<string>("project");
+  const [s31AlignTo, setS31AlignTo] = React.useState<string>("interior");
+  const [step31Output, setStep31Output] = React.useState<any>(null);
+
+  // State Step 3.2 (Découpeur Dalles)
+  const [s32Scope, setS32Scope] = React.useState<string>("project");
+  const [s32SplitRef, setS32SplitRef] = React.useState<string>("axis");
+  const [step32Output, setStep32Output] = React.useState<any>(null);
+
+  // State Step 4 (Voiles ASC/ESC & Offsets)
+  const [stats, setStats] = React.useState<any>(null);
+  const [isLoadingStats, setIsLoadingStats] = React.useState<boolean>(false);
+  const [step4OutputMsg, setStep4OutputMsg] = React.useState<string | null>(null);
+
+  const [pipelineProgress, setPipelineProgress] = React.useState<string | null>(null);
+
+  const taskStep1 = useRevitTask();
+  const taskStep2 = useRevitTask();
+  const taskStep31 = useRevitTask();
+  const taskStep32 = useRevitTask();
+  const taskStep4 = useRevitTask();
+  const taskMain = useRevitTask();
+
+  // Handlers
+  const handleRunStep1 = async () => {
+    const res = await taskStep1.run(
+      runtime.getCode("step1-main", {
+        linkFilePath: filePath,
+        centralModelPath: centralPath,
+      })
+    );
+    if (res.ok) {
+      setActiveTab("step2");
+    }
+  };
+
+  const handleRunStepReconstructeur = async () => {
+    setStep2Result(null);
+    const res = await taskStep2.run(runtime.getCode("step4-main"));
+    if (res.ok && res.output) {
+      setStep2Result(res.output as any);
+      setActiveTab("step3_1");
+    }
+  };
+
+  const handleRunStep31Aligner = async () => {
+    setStep31Output(null);
+    const res = await taskStep31.run(
+      runtime.getCode("step3-main", { scope: s31Scope, action: "align", alignTo: s31AlignTo, splitRef: "axis" })
+    );
+    if (res.ok && res.output) {
+      setStep31Output(res.output as any);
+      setActiveTab("step3_2");
+    }
+  };
+
+  const handleRunStep32Decouper = async () => {
+    setStep32Output(null);
+    const res = await taskStep32.run(
+      runtime.getCode("step3-main", { scope: s32Scope, action: "split", alignTo: "interior", splitRef: s32SplitRef })
+    );
+    if (res.ok && res.output) {
+      setStep32Output(res.output as any);
+      setActiveTab("step4");
+    }
+  };
+
+  const loadStats = React.useCallback(async () => {
+    setIsLoadingStats(true);
+    const res = await execute(runtime.getCode("load-stats"));
+    if (res.ok && res.output) {
+      setStats(res.output);
+    }
+    setIsLoadingStats(false);
+  }, []);
+
+  React.useEffect(() => {
+    void loadStats();
+  }, [loadStats]);
+
+  const handleStepVoilesAction = async (action: "convert_asc_ext" | "apply_offsets") => {
+    setStep4OutputMsg(null);
+    const code = runtime.getCode("step2-main", { action });
+    const res = await taskStep4.run(code);
+    if (res.ok && res.output) {
+      setStep4OutputMsg((res.output as any).message);
+      void loadStats();
+    }
+  };
+
+  const handleRunAllPipeline = async () => {
+    setActiveTab("step1");
+    setPipelineProgress("Étape 1/5 : Initialisation Fond STR...");
+    const res1 = await taskMain.run(
+      runtime.getCode("step1-main", {
+        linkFilePath: filePath,
+        centralModelPath: centralPath,
+      })
+    );
+    if (!res1.ok) {
+      setPipelineProgress("Erreur lors de l'Étape 1");
+      return;
+    }
+
+    setActiveTab("step2");
+    setPipelineProgress("Étape 2/5 : Reconstruction & Normalisation Structure...");
+    setStep2Result(null);
+    const res2 = await taskMain.run(runtime.getCode("step4-main"));
+    if (res2.ok && res2.output) {
+      setStep2Result(res2.output as any);
+    } else {
+      setPipelineProgress("Erreur lors de l'Étape 2");
+      return;
+    }
+
+    setActiveTab("step3_1");
+    setPipelineProgress("Étape 3.1/5 : Alignement des dalles sur voiles...");
+    setStep31Output(null);
+    const res31 = await taskMain.run(
+      runtime.getCode("step3-main", { scope: s31Scope, action: "align", alignTo: s31AlignTo, splitRef: "axis" })
+    );
+    if (res31.ok && res31.output) {
+      setStep31Output(res31.output as any);
+    } else {
+      setPipelineProgress("Erreur lors de l'Étape 3.1");
+      return;
+    }
+
+    setActiveTab("step3_2");
+    setPipelineProgress("Étape 3.2/5 : Découpage des dalles par voiles...");
+    setStep32Output(null);
+    const res32 = await taskMain.run(
+      runtime.getCode("step3-main", { scope: s32Scope, action: "split", alignTo: "interior", splitRef: s32SplitRef })
+    );
+    if (res32.ok && res32.output) {
+      setStep32Output(res32.output as any);
+    } else {
+      setPipelineProgress("Erreur lors de l'Étape 3.2");
+      return;
+    }
+
+    setActiveTab("step4");
+    setPipelineProgress("Étape 4/5 : Conversion Voiles ASC/ESC & Décalages d'Arase...");
+    setStep4OutputMsg(null);
+    await taskMain.run(runtime.getCode("step2-main", { action: "convert_asc_ext" }));
+    const res4 = await taskMain.run(runtime.getCode("step2-main", { action: "apply_offsets" }));
+    if (res4.ok && res4.output) {
+      setStep4OutputMsg((res4.output as any).message);
+      void loadStats();
+    }
+
+    setPipelineProgress("Workflow global terminé avec succès ! (Étapes 1 à 4)");
+  };
+
+  const floorColumns = React.useMemo(
+    () => [
+      { key: "id", header: "ID Element" },
+      { key: "name", header: "Nom de la Dalle", sortable: true },
+      { key: "level", header: "Niveau", sortable: true },
+      { key: "status", header: "Statut Traitement", sortable: true },
+    ],
+    []
+  );
+
+  return (
+    <Card className="p-4 flex flex-col gap-4">
+      {/* Banner / Pipeline run */}
+      <div className="flex items-center justify-between bg-muted/50 p-3 rounded-lg border">
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className="text-xs">Workflow global</Badge>
+            <span className="font-semibold text-sm">Combinaison 5 modules STR</span>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {pipelineProgress || "Exécutez étape par étape ou lancez le processus complet ordonné."}
+          </p>
+        </div>
+        <Button
+          onClick={handleRunAllPipeline}
+          disabled={taskMain.running}
+          size="sm"
+          className="gap-2"
+        >
+          <PlayIcon className="size-4" />
+          Exécuter Tout (1-4)
+        </Button>
+      </div>
+
+      <RevitTaskBar task={taskMain} />
+
+      {taskMain.result?.ok && (
+        <Alert>
+          <CheckCircle2Icon className="size-4 text-green-600" />
+          <AlertTitle>Processus global terminé avec succès !</AlertTitle>
+          <AlertDescription className="text-xs">
+            Toutes les étapes ont été exécutées avec succès dans l'ordre.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      <Separator />
+
+      {/* Navigation */}
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+        <TabsList className="grid grid-cols-3 gap-1 h-auto p-1 w-full">
+          <TabsTrigger value="step1" className="text-xs py-1.5 justify-center">1. Fond STR</TabsTrigger>
+          <TabsTrigger value="step2" className="text-xs py-1.5 justify-center">2. Normaliseur</TabsTrigger>
+          <TabsTrigger value="step3_1" className="text-xs py-1.5 justify-center">3.1 Aligner</TabsTrigger>
+          <TabsTrigger value="step3_2" className="text-xs py-1.5 justify-center">3.2 Découper</TabsTrigger>
+          <TabsTrigger value="step4" className="text-xs py-1.5 justify-center col-span-2">4. Voiles ASC</TabsTrigger>
+        </TabsList>
+
+        {/* STEP 1 */}
+        <TabsContent value="step1" className="flex flex-col gap-4 mt-3">
+          <div className="flex flex-col gap-1">
+            <h3 className="font-medium text-sm">1. Création du fond de la maquette STR d'EIFFAGE</h3>
+            <p className="text-xs text-muted-foreground">
+              Création des sous-projets, copie des niveaux/quadrillages décalés et génération des plans STR.
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-3 bg-card p-3 border rounded-md">
+            <div className="flex flex-col gap-2">
+              <Label className="text-xs">Architectural Model Path (.rvt)</Label>
+              <div className="flex gap-2">
+                <Input
+                  value={filePath}
+                  onChange={(e) => setFilePath(e.target.value)}
+                  placeholder="Select architectural .rvt file..."
+                  className="h-8 text-xs"
+                />
+                <Button variant="outline" size="sm" onClick={async () => {
+                  const res = await execute(runtime.getCode("open-file"));
+                  if (res.ok && (res.output as any)?.path) setFilePath((res.output as any).path);
+                }}>
+                  Browse
+                </Button>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <Label className="text-xs">Central Model Save Location & Name (.rvt)</Label>
+              <div className="flex gap-2">
+                <Input
+                  value={centralPath}
+                  onChange={(e) => setCentralPath(e.target.value)}
+                  placeholder="Select location & central model name (optional)..."
+                  className="h-8 text-xs"
+                />
+                <Button variant="outline" size="sm" onClick={async () => {
+                  const res = await execute(runtime.getCode("pick-central-file"));
+                  if (res.ok && (res.output as any)?.path) setCentralPath((res.output as any).path);
+                }}>
+                  Browse
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <RevitTaskBar task={taskStep1} />
+
+          <div className="flex gap-2 pt-2">
+            <Button onClick={handleRunStep1} disabled={taskStep1.running} size="sm" className="flex-1 gap-2">
+              <PlayIcon className="size-4" />
+              Lancer Étape 1
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step2")} className="gap-1">
+              Étape 2 <ChevronRightIcon className="size-4" />
+            </Button>
+          </div>
+        </TabsContent>
+
+        {/* STEP 2 */}
+        <TabsContent value="step2" className="flex flex-col gap-4 mt-3">
+          <div className="flex flex-col gap-1">
+            <h3 className="font-medium text-sm">2. Reconstructeur & Normaliseur Structure (STR)</h3>
+            <p className="text-xs text-muted-foreground">
+              Reconstruit 100% des éléments structurels depuis la maquette Archi liée vers des familles STR.
+            </p>
+          </div>
+
+          <RevitTaskBar task={taskStep2} />
+
+          {step2Result && (
+            <Alert>
+              <CheckCircle2Icon className="size-4 text-green-600" />
+              <AlertTitle>Normalisation terminée avec succès !</AlertTitle>
+              <AlertDescription className="text-xs flex flex-col gap-1 mt-1">
+                <span>Maquette source : {step2Result.linkTitle}</span>
+                <span>Voiles : {step2Result.wallsRebuilt} | Poteaux : {step2Result.columnsRebuilt} | Dalles : {step2Result.floorsRebuilt}</span>
+                <span>Portes : {step2Result.doorsRebuilt} | Fenêtres : {step2Result.windowsRebuilt}</span>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step1")} className="gap-1">
+              <ChevronLeftIcon className="size-4" /> Étape 1
+            </Button>
+            <Button onClick={handleRunStepReconstructeur} disabled={taskStep2.running} size="sm" className="flex-1 gap-2">
+              <PlayIcon className="size-4" />
+              {taskStep2.running ? "Reconstruction..." : "Lancer Étape 2"}
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step3_1")} className="gap-1">
+              Étape 3.1 <ChevronRightIcon className="size-4" />
+            </Button>
+          </div>
+        </TabsContent>
+
+        {/* STEP 3.1: ALIGNER */}
+        <TabsContent value="step3_1" className="flex flex-col gap-4 mt-3">
+          <div className="flex flex-col gap-1">
+            <h3 className="font-medium text-sm">3.1 Alignement des Dalles sur Voiles</h3>
+            <p className="text-xs text-muted-foreground">
+              Ajuste les contours des dalles structurelles sur le nu intérieur, l'axe ou le nu extérieur des voiles.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 bg-card p-3 border rounded-md">
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Portée du traitement</Label>
+              <Select value={s31Scope} onValueChange={setS31Scope}>
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="project">Tout le projet</SelectItem>
+                    <SelectItem value="view">Vue active</SelectItem>
+                    <SelectItem value="selected">Éléments sélectionnés</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Aligner les dalles sur</Label>
+              <Select value={s31AlignTo} onValueChange={setS31AlignTo}>
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="interior">Nu intérieur du voile</SelectItem>
+                    <SelectItem value="axis">Axe du voile</SelectItem>
+                    <SelectItem value="exterior">Nu extérieur du voile</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <RevitTaskBar task={taskStep31} />
+
+          {step31Output && (
+            <div className="flex flex-col gap-2">
+              <Alert>
+                <CheckCircle2Icon className="size-4 text-green-600" />
+                <AlertTitle>Alignement des dalles terminé !</AlertTitle>
+                <AlertDescription className="text-xs">
+                  {step31Output.updatedCount} dalle(s) alignée(s), {step31Output.skippedCount} ignorée(s).
+                </AlertDescription>
+              </Alert>
+
+              {step31Output.floors && step31Output.floors.length > 0 && (
+                <DataTable
+                  columns={floorColumns}
+                  data={step31Output.floors}
+                  pageSize={5}
+                />
+              )}
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step2")} className="gap-1">
+              <ChevronLeftIcon className="size-4" /> Étape 2
+            </Button>
+            <Button onClick={handleRunStep31Aligner} disabled={taskStep31.running} size="sm" className="flex-1 gap-2">
+              <PlayIcon className="size-4" />
+              Lancer Étape 3.1 (Aligner)
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step3_2")} className="gap-1">
+              Étape 3.2 <ChevronRightIcon className="size-4" />
+            </Button>
+          </div>
+        </TabsContent>
+
+        {/* STEP 3.2: DÉCOUPER */}
+        <TabsContent value="step3_2" className="flex flex-col gap-4 mt-3">
+          <div className="flex flex-col gap-1">
+            <h3 className="font-medium text-sm">3.2 Découpage des Dalles par Voiles</h3>
+            <p className="text-xs text-muted-foreground">
+              Découpe automatiquement les grandes dalles le long des voiles porteurs selon leur axe ou leurs nus.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 bg-card p-3 border rounded-md">
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Portée du traitement</Label>
+              <Select value={s32Scope} onValueChange={setS32Scope}>
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="project">Tout le projet</SelectItem>
+                    <SelectItem value="view">Vue active</SelectItem>
+                    <SelectItem value="selected">Éléments sélectionnés</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs">Référence de découpe</Label>
+              <Select value={s32SplitRef} onValueChange={setS32SplitRef}>
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="axis">Axe du voile (Ligne centrale)</SelectItem>
+                    <SelectItem value="contact">Faces de contact du voile (Nu du voile)</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <RevitTaskBar task={taskStep32} />
+
+          {step32Output && (
+            <div className="flex flex-col gap-2">
+              <Alert>
+                <CheckCircle2Icon className="size-4 text-green-600" />
+                <AlertTitle>Découpage des dalles terminé !</AlertTitle>
+                <AlertDescription className="text-xs">
+                  {step32Output.updatedCount} dalle(s) découpée(s), {step32Output.skippedCount} ignorée(s).
+                </AlertDescription>
+              </Alert>
+
+              {step32Output.floors && step32Output.floors.length > 0 && (
+                <DataTable
+                  columns={floorColumns}
+                  data={step32Output.floors}
+                  pageSize={5}
+                />
+              )}
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step3_1")} className="gap-1">
+              <ChevronLeftIcon className="size-4" /> Étape 3.1
+            </Button>
+            <Button onClick={handleRunStep32Decouper} disabled={taskStep32.running} size="sm" className="flex-1 gap-2">
+              <PlayIcon className="size-4" />
+              Lancer Étape 3.2 (Découper)
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step4")} className="gap-1">
+              Étape 4 <ChevronRightIcon className="size-4" />
+            </Button>
+          </div>
+        </TabsContent>
+
+        {/* STEP 4 */}
+        <TabsContent value="step4" className="flex flex-col gap-4 mt-3">
+          <div className="flex flex-col gap-1">
+            <h3 className="font-medium text-sm">4. Voiles ASC/ESC & Décalages d'Arase</h3>
+            <p className="text-xs text-muted-foreground">
+              Conversion des voiles de cage ASC/ESC en EXT et ajustement automatique des décalages d'arase INT/EXT.
+            </p>
+          </div>
+
+          {/* Stats Display */}
+          <div className="flex flex-col gap-2 bg-card p-3 border rounded-md">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold">Statistiques des Voiles</span>
+              <Button variant="ghost" size="sm" onClick={loadStats} disabled={isLoadingStats} className="h-6 px-2 text-xs gap-1">
+                <RefreshCwIcon className="size-3" /> Actualiser
+              </Button>
+            </div>
+            {stats ? (
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="bg-muted p-2 rounded flex justify-between">
+                  <span>Voiles INT :</span>
+                  <span className="font-bold">{stats.intCount}</span>
+                </div>
+                <div className="bg-muted p-2 rounded flex justify-between">
+                  <span>Voiles EXT :</span>
+                  <span className="font-bold">{stats.extCount}</span>
+                </div>
+                <div className="bg-muted p-2 rounded flex justify-between">
+                  <span>Cage ASC/ESC INT :</span>
+                  <span className="font-bold">{stats.ascIntCount}</span>
+                </div>
+                <div className="bg-muted p-2 rounded flex justify-between">
+                  <span>Cage ASC/ESC EXT :</span>
+                  <span className="font-bold">{stats.ascExtCount}</span>
+                </div>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">Chargement des statistiques...</p>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Button
+              onClick={() => handleStepVoilesAction("convert_asc_ext")}
+              disabled={taskStep4.running}
+              size="sm"
+              variant="outline"
+              className="justify-start gap-2"
+            >
+              <PlayIcon className="size-4 text-primary" />
+              Convertir Voiles Cage ASC/ESC ➔ EXT
+            </Button>
+
+            <Button
+              onClick={() => handleStepVoilesAction("apply_offsets")}
+              disabled={taskStep4.running}
+              size="sm"
+              variant="outline"
+              className="justify-start gap-2"
+            >
+              <PlayIcon className="size-4 text-primary" />
+              Ajuster Décalages d'Arase (INT = -Ép. Dalle, EXT = 0)
+            </Button>
+          </div>
+
+          <RevitTaskBar task={taskStep4} />
+
+          {step4OutputMsg && (
+            <Alert>
+              <CheckCircle2Icon className="size-4 text-green-600" />
+              <AlertTitle>Action Étape 4 terminée !</AlertTitle>
+              <AlertDescription className="text-xs">{step4OutputMsg}</AlertDescription>
+            </Alert>
+          )}
+
+          <div className="flex items-center justify-between pt-2 border-t">
+            <Button variant="outline" size="sm" onClick={() => setActiveTab("step3_2")} className="gap-1">
+              <ChevronLeftIcon className="size-4" /> Étape 3.2 (Découper)
+            </Button>
+            <span className="text-xs text-muted-foreground">Dernière étape du workflow</span>
+          </div>
+        </TabsContent>
+      </Tabs>
+    </Card>
+  );
+}
